@@ -1,0 +1,22 @@
+# wxt
+.output
+.wxt
+stats.html
+stats-*.json
+web-ext.config.ts
+
+# Node
+node_modules
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

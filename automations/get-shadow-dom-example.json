@@ -1,0 +1,12 @@
+{
+  "name": "Example: read inside Shadow DOM",
+  "description": "Two ways to reach into an open shadow root: (1) auto-pierce — just write the selector for the inner element and the finder recurses into shadow roots after failing in the light DOM; (2) explicit hop-by-hop with `>>>`, which calls .shadowRoot.querySelector() between segments. Try this on a page with web components.",
+  "tag": "get",
+  "steps": [
+    {
+      "action": "get",
+      "selector": "my-component >>> input.email",
+      "saveAs": "emailFromShadow"
+    }
+  ]
+}

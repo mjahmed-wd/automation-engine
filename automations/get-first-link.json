@@ -1,0 +1,8 @@
+{
+  "name": "Get first link href",
+  "description": "Reads the `href` attribute of the first <a> on the page. Demonstrates extracting an attribute.",
+  "tag": "get",
+  "steps": [
+    { "action": "get", "selector": "a", "attribute": "href", "saveAs": "firstLink" }
+  ]
+}

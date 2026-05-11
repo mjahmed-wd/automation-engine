@@ -1,0 +1,8 @@
+{
+  "name": "Paylowpro: Read Last Name",
+  "description": "Reads the current value of the Last Name input on paylowpro.com.",
+  "tag": "get",
+  "steps": [
+    { "action": "get", "label": "Last Name", "saveAs": "lastName" }
+  ]
+}

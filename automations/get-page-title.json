@@ -1,0 +1,8 @@
+{
+  "name": "Get page title",
+  "description": "Pulls the document <title> tag's text. Demonstrates `property: textContent` on a non-input element.",
+  "tag": "get",
+  "steps": [
+    { "action": "get", "selector": "title", "property": "textContent", "saveAs": "title" }
+  ]
+}

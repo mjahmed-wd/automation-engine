@@ -1,0 +1,18 @@
+{
+  "name": "Paylowpro: Fill Contact (multi-step)",
+  "description": "Navigate, fill three fields, then verify by reading one back.",
+  "tag": "action",
+  "variables": {
+    "firstName": "Md.",
+    "lastName": "Jubair",
+    "email": "jubair@paylowpro.com"
+  },
+  "steps": [
+    { "action": "goto", "url": "https://www.paylowpro.com/" },
+    { "action": "fill", "label": "First Name", "value": "{{firstName}}" },
+    { "action": "fill", "label": "Last Name",  "value": "{{lastName}}" },
+    { "action": "fill", "label": "Email",      "value": "{{email}}" },
+    { "action": "wait", "ms": 250 },
+    { "action": "get",  "label": "Email", "saveAs": "verifiedEmail" }
+  ]
+}

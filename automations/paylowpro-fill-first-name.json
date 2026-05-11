@@ -1,0 +1,12 @@
+{
+  "name": "Paylowpro: Fill First Name",
+  "description": "Navigates to paylowpro.com and types into the First Name field in the Zoho iframe.",
+  "tag": "action",
+  "variables": {
+    "firstName": "Md. jubair"
+  },
+  "steps": [
+    { "action": "goto", "url": "https://www.paylowpro.com/" },
+    { "action": "fill", "label": "First Name", "value": "{{firstName}}" }
+  ]
+}
