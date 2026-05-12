@@ -5,6 +5,6 @@ import type { Page } from '../page';
 export async function fillAction(step: FillStep, ctx: ExecutionContext, page: Page) {
   const locator = resolveLocator(step, ctx);
   const value = substitute(step.value, ctx);
-  const result = await page.fill(locator, value);
+  const result = await page.fill(locator, value, { pierceClosed: step.pierceClosed });
   ctx.log('success', `Filled "${result.value}" in ${result.frame}`);
 }

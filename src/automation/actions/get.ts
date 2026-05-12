@@ -9,6 +9,7 @@ export async function getAction(step: GetStep, ctx: ExecutionContext, page: Page
     property: step.property,
     regex: step.regex,
     regexFlags: step.regexFlags,
+    pierceClosed: step.pierceClosed,
   });
   const value = result.value ?? '';
   if (step.saveAs) ctx.outputs[step.saveAs] = value;

@@ -1,0 +1,12 @@
+{
+  "name": "Shepherd: toggle Pay All Invoices (XPath)",
+  "description": "Clicks the toggle next to the text 'Pay All Invoices' using an XPath that anchors the label by its sibling text. pierceClosed:true uses CDP DOM.performSearch which understands XPath and traverses closed shadow roots.",
+  "tag": "action",
+  "steps": [
+    {
+      "action": "click",
+      "xpath": "//label[contains(@class, 'toggle-button')][../span[contains(normalize-space(.), 'Pay All Invoices')]]",
+      "pierceClosed": true
+    }
+  ]
+}

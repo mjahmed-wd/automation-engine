@@ -98,8 +98,85 @@ function buildFinderExpression(locator: Locator, requireVisible: boolean): strin
     }
   `;
 
+  // ---- XPath path ----
+  // document.evaluate handles the light DOM. For open shadow roots we walk
+  // every shadowRoot and evaluate XPath scoped to it. Closed shadow roots
+  // are unreachable here; the CDP path (DOM.performSearch) handles those.
+  if (locator.xpath) {
+    const xpLit = JSON.stringify(locator.xpath);
+    return `(() => {
+      ${visibleFn}
+      function evalIn(root, xp) {
+        try {
+          const doc = root.ownerDocument || (root.nodeType === 9 ? root : document);
+          const ctx = (root.nodeType === 9 || root.nodeType === 11) ? root : root;
+          const res = doc.evaluate(xp, ctx, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          if (res && res.singleNodeValue) return res.singleNodeValue;
+        } catch (e) {}
+        return null;
+      }
+      function deepEval(root, xp) {
+        const direct = evalIn(root, xp);
+        if (direct) return direct;
+        const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (let i = 0; i < all.length; i++) {
+          if (all[i].shadowRoot) {
+            const hit = deepEval(all[i].shadowRoot, xp);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      }
+      const el = deepEval(document, ${xpLit});
+      if (!el || !visible(el)) return null;
+      return el;
+    })()`;
+  }
+
   if (locator.selector) {
     const selLiteral = JSON.stringify(locator.selector);
+
+    // When `nearText` is also set, refine: find all elements (light + open
+    // shadow) whose direct text matches; then look in each one's parent chain
+    // for an element matching `selector`. First match wins.
+    if (locator.nearText) {
+      const txtLiteral = JSON.stringify(locator.nearText);
+      return `(() => {
+        ${helpers}
+        const SEL = ${selLiteral};
+        const re = new RegExp(${txtLiteral}.trim().replace(/\\s+/g, '\\\\s*'), 'i');
+        function directText(el) {
+          let t = '';
+          for (let i = 0; i < el.childNodes.length; i++) {
+            const c = el.childNodes[i];
+            if (c.nodeType === 3) t += c.nodeValue || '';
+          }
+          return t;
+        }
+        function collectStarts(root, out) {
+          const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+          for (let i = 0; i < all.length; i++) {
+            const el = all[i];
+            if (re.test(directText(el))) out.push(el);
+            if (el.shadowRoot) collectStarts(el.shadowRoot, out);
+          }
+        }
+        const starts = [];
+        collectStarts(document, starts);
+        for (let s = 0; s < starts.length; s++) {
+          let el = starts[s];
+          for (let d = 0; d < 6 && el; d++) {
+            const parent = el.parentElement || (el.getRootNode && el.getRootNode().host);
+            if (!parent) break;
+            const hit = parent.querySelector(SEL);
+            if (hit && visible(hit)) return hit;
+            el = parent;
+          }
+        }
+        return null;
+      })()`;
+    }
+
     return `(() => {
       ${helpers}
       const el = pierceSelector(${selLiteral});
@@ -158,6 +235,91 @@ function buildFinderExpression(locator: Locator, requireVisible: boolean): strin
     })()`;
   }
   return 'null';
+}
+
+/**
+ * Same action logic as `buildActionExpression`, but shaped as a `function () {...}`
+ * suitable for CDP's `Runtime.callFunctionOn`. The function's `this` is the
+ * already-resolved DOM element (returned by `DOM.resolveNode`), so no in-page
+ * finder runs. This is what the closed-shadow-DOM fallback path uses.
+ */
+export function buildCallFunctionExpression(
+  mode: Mode,
+  opts: { value?: string } & GetOptions = {},
+): string {
+  let actionBlock = '';
+  if (mode === 'fill') {
+    const valueLiteral = JSON.stringify(opts.value ?? '');
+    actionBlock = `
+      this.focus();
+      const proto = Object.getPrototypeOf(this);
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      const setter = desc && desc.set;
+      if (setter) setter.call(this, ${valueLiteral});
+      else this.value = ${valueLiteral};
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+    `;
+  } else if (mode === 'click') {
+    actionBlock = `
+      this.scrollIntoView({ block: 'center', inline: 'center' });
+      if (typeof this.click === 'function') this.click();
+      else this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    `;
+  }
+
+  let valueExpr: string;
+  if (mode === 'get') {
+    const attrLit = JSON.stringify(opts.attribute ?? '');
+    const propLit = JSON.stringify(opts.property ?? '');
+    const regexLit = JSON.stringify(opts.regex ?? '');
+    const flagsLit = JSON.stringify(opts.regexFlags ?? '');
+    valueExpr = `(() => {
+      const ATTR = ${attrLit};
+      const PROP = ${propLit};
+      const RX = ${regexLit};
+      const FLAGS = ${flagsLit};
+      let raw;
+      if (ATTR) {
+        raw = this.getAttribute(ATTR);
+        if (raw == null) raw = '';
+      } else {
+        let p = PROP;
+        if (!p) {
+          const t = this.tagName;
+          p = (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') ? 'value' : 'innerText';
+        }
+        const v = this[p];
+        raw = v == null ? '' : (typeof v === 'string' ? v : String(v));
+      }
+      if (RX) {
+        try {
+          const m = raw.match(new RegExp(RX, FLAGS));
+          if (!m) return '';
+          return m.length > 1 ? (m[1] ?? '') : m[0];
+        } catch (e) {
+          throw new Error('Bad regex: ' + e.message);
+        }
+      }
+      return raw;
+    }).call(this)`;
+  } else {
+    valueExpr = `('value' in this ? String(this.value) : (this.textContent || '').trim())`;
+  }
+
+  return `
+    function () {
+      ${actionBlock}
+      const __value = ${valueExpr};
+      return {
+        ok: true,
+        value: __value,
+        frame: location.href,
+        tag: this.tagName,
+        name: this.name || this.id || '',
+      };
+    }
+  `;
 }
 
 export function buildActionExpression(

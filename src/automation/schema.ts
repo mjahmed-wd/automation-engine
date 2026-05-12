@@ -12,7 +12,25 @@
 
 export interface Locator {
   label?: string;
+  /** CSS selector (supports the `>>>` shadow-piercing syntax in the fast path). */
   selector?: string;
+  /**
+   * XPath expression. Mutually alternative to `selector`. Use this when you
+   * want native text matching, structural ancestor/sibling queries, or any
+   * of XPath's tools that CSS doesn't have. Examples:
+   *   //input[@data-test-id='invoice-paymentTable-input']
+   *   //label[contains(@class,'toggle-button')]
+   *   //label[ancestor::div[.//span[normalize-space(text())='Pay All Invoices']]]
+   */
+  xpath?: string;
+  /**
+   * Refines a `selector` match by requiring it to be near (within ~6 ancestor
+   * levels of) an element whose own direct text content matches this string.
+   * Lets you say "the toggle near 'Pay All Invoices'" without depending on
+   * auto-generated ids. Pair with `selector`; for `xpath`, write the relation
+   * directly into the XPath expression.
+   */
+  nearText?: string;
 }
 
 export interface BaseStep {
@@ -29,6 +47,13 @@ export interface FillStep extends BaseStep {
   label?: string;
   selector?: string;
   value: string;
+  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
+   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
+  pierceClosed?: boolean;
+  /** XPath expression — alternative to `selector`. See Locator.xpath. */
+  xpath?: string;
+  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
+  nearText?: string;
 }
 
 /**
@@ -52,12 +77,26 @@ export interface GetStep extends BaseStep {
   regex?: string;
   regexFlags?: string;
   saveAs?: string;
+  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
+   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
+  pierceClosed?: boolean;
+  /** XPath expression — alternative to `selector`. See Locator.xpath. */
+  xpath?: string;
+  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
+  nearText?: string;
 }
 
 export interface ClickStep extends BaseStep {
   action: 'click';
   label?: string;
   selector?: string;
+  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
+   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
+  pierceClosed?: boolean;
+  /** XPath expression — alternative to `selector`. See Locator.xpath. */
+  xpath?: string;
+  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
+  nearText?: string;
 }
 
 export interface WaitStep extends BaseStep {
@@ -70,6 +109,13 @@ export interface WaitForStep extends BaseStep {
   label?: string;
   selector?: string;
   timeoutMs?: number;
+  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
+   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
+  pierceClosed?: boolean;
+  /** XPath expression — alternative to `selector`. See Locator.xpath. */
+  xpath?: string;
+  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
+  nearText?: string;
 }
 
 export type AutomationStep =
@@ -111,14 +157,16 @@ export function substitute(str: string, ctx: ExecutionContext): string {
 
 /** Build a Locator from a step's label/selector, with variable substitution. */
 export function resolveLocator(
-  step: { label?: string; selector?: string },
+  step: { label?: string; selector?: string; xpath?: string; nearText?: string },
   ctx: ExecutionContext,
 ): Locator {
   const out: Locator = {};
   if (step.label) out.label = substitute(step.label, ctx);
   if (step.selector) out.selector = substitute(step.selector, ctx);
-  if (!out.label && !out.selector) {
-    throw new Error('Step requires either "label" or "selector"');
+  if (step.xpath) out.xpath = substitute(step.xpath, ctx);
+  if (step.nearText) out.nearText = substitute(step.nearText, ctx);
+  if (!out.label && !out.selector && !out.xpath) {
+    throw new Error('Step requires "label", "selector", or "xpath"');
   }
   return out;
 }
