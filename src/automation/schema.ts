@@ -1,36 +1,17 @@
 /**
- * Automation schema — types used by the interpreter and by JSON authoring.
+ * Automation schema.
  *
- * Each step is discriminated by its `action` string. Example shapes:
+ * One locator type: `xpath`. Iframes, open and closed shadow roots, and text
+ * relations are all expressible in XPath, so we don't carry alternative
+ * finders.
  *
- *   { "action": "goto",  "url": "https://example.com" }
- *   { "action": "fill",  "label": "Email", "value": "{{email}}" }
- *   { "action": "get",   "selector": "h1", "saveAs": "title" }
- *   { "action": "get",   "selector": "a.cta", "attribute": "href", "saveAs": "url" }
- *   { "action": "get",   "selector": ".price", "regex": "\\$([0-9.,]+)", "saveAs": "price" }
+ *   { "action": "fill",   "xpath": "//input[@name='email']", "value": "x@y.z" }
+ *   { "action": "get",    "xpath": "//h1", "saveAs": "title" }
+ *   { "action": "click",  "xpath": "//button[normalize-space(.)='Save']" }
  */
 
 export interface Locator {
-  label?: string;
-  /** CSS selector (supports the `>>>` shadow-piercing syntax in the fast path). */
-  selector?: string;
-  /**
-   * XPath expression. Mutually alternative to `selector`. Use this when you
-   * want native text matching, structural ancestor/sibling queries, or any
-   * of XPath's tools that CSS doesn't have. Examples:
-   *   //input[@data-test-id='invoice-paymentTable-input']
-   *   //label[contains(@class,'toggle-button')]
-   *   //label[ancestor::div[.//span[normalize-space(text())='Pay All Invoices']]]
-   */
-  xpath?: string;
-  /**
-   * Refines a `selector` match by requiring it to be near (within ~6 ancestor
-   * levels of) an element whose own direct text content matches this string.
-   * Lets you say "the toggle near 'Pay All Invoices'" without depending on
-   * auto-generated ids. Pair with `selector`; for `xpath`, write the relation
-   * directly into the XPath expression.
-   */
-  nearText?: string;
+  xpath: string;
 }
 
 export interface BaseStep {
@@ -44,21 +25,16 @@ export interface GotoStep extends BaseStep {
 
 export interface FillStep extends BaseStep {
   action: 'fill';
-  label?: string;
-  selector?: string;
+  xpath: string;
   value: string;
-  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
+  /** Skip the Runtime.evaluate fast path and go straight to the CDP DOM walk
    *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
   pierceClosed?: boolean;
-  /** XPath expression — alternative to `selector`. See Locator.xpath. */
-  xpath?: string;
-  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
-  nearText?: string;
 }
 
 /**
- * `get` reads any value from the page: input value, text content, an
- * attribute, or a regex extract over any of those.
+ * `get` reads any value from the matched element: input value, text content,
+ * an attribute, or a regex extract over any of those.
  *
  * Default property when neither `attribute` nor `property` is set:
  *   - `<input>` / `<textarea>` / `<select>`  → "value"
@@ -70,33 +46,19 @@ export interface FillStep extends BaseStep {
  */
 export interface GetStep extends BaseStep {
   action: 'get';
-  label?: string;
-  selector?: string;
+  xpath: string;
   attribute?: string;
   property?: string;
   regex?: string;
   regexFlags?: string;
   saveAs?: string;
-  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
-   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
   pierceClosed?: boolean;
-  /** XPath expression — alternative to `selector`. See Locator.xpath. */
-  xpath?: string;
-  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
-  nearText?: string;
 }
 
 export interface ClickStep extends BaseStep {
   action: 'click';
-  label?: string;
-  selector?: string;
-  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
-   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
+  xpath: string;
   pierceClosed?: boolean;
-  /** XPath expression — alternative to `selector`. See Locator.xpath. */
-  xpath?: string;
-  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
-  nearText?: string;
 }
 
 export interface WaitStep extends BaseStep {
@@ -106,16 +68,9 @@ export interface WaitStep extends BaseStep {
 
 export interface WaitForStep extends BaseStep {
   action: 'waitFor';
-  label?: string;
-  selector?: string;
+  xpath: string;
   timeoutMs?: number;
-  /** Skip the fast Runtime.evaluate path and go straight to the CDP DOM-walk
-   *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
   pierceClosed?: boolean;
-  /** XPath expression — alternative to `selector`. See Locator.xpath. */
-  xpath?: string;
-  /** Refines `selector` by requiring it to live near this text. See Locator.nearText. */
-  nearText?: string;
 }
 
 export type AutomationStep =
@@ -146,8 +101,25 @@ export interface ExecutionContext {
   log: LogFn;
 }
 
-/** Replace `{{name}}` tokens using outputs first, then variables. */
-export function substitute(str: string, ctx: ExecutionContext): string {
+// -------------------------------------------------------------------------
+// Substitution
+// -------------------------------------------------------------------------
+
+/** Encode a runtime string as an XPath string literal. */
+function xpathStringLiteral(value: string): string {
+  if (!value.includes("'")) return `'${value}'`;
+  if (!value.includes('"')) return `"${value}"`;
+  const parts = value.split("'");
+  const tokens: string[] = [];
+  parts.forEach((p, i) => {
+    if (i > 0) tokens.push(`"'"`);
+    if (p) tokens.push(`'${p}'`);
+  });
+  return `concat(${tokens.join(', ')})`;
+}
+
+/** Plain `{{var}}` substitution — for free-text fields (value, url). */
+export function substituteRaw(str: string, ctx: ExecutionContext): string {
   return str.replace(/\{\{(\w+)\}\}/g, (_, name) => {
     if (name in ctx.outputs) return ctx.outputs[name];
     if (name in ctx.variables) return ctx.variables[name];
@@ -155,18 +127,33 @@ export function substitute(str: string, ctx: ExecutionContext): string {
   });
 }
 
-/** Build a Locator from a step's label/selector, with variable substitution. */
+/**
+ * XPath substitution. Accepts both shapes:
+ *   `//input[@name={{n}}]`        — bare token, becomes a literal
+ *   `//input[@name='{{n}}']`      — surrounding single quotes get stripped
+ *   `//input[@name="{{n}}"]`      — surrounding double quotes get stripped
+ */
+export function substituteXPath(template: string, ctx: ExecutionContext): string {
+  return template.replace(
+    /(['"])?\{\{(\w+)\}\}\1?/g,
+    function (match, _quote, name) {
+      if (!(name in ctx.outputs) && !(name in ctx.variables)) return match;
+      const value = String(ctx.outputs[name] ?? ctx.variables[name]);
+      return xpathStringLiteral(value);
+    },
+  );
+}
+
+/** Back-compat alias for callers that imported the original. */
+export const substitute = substituteRaw;
+
+/** Build the locator object for a step, with XPath substitution applied. */
 export function resolveLocator(
-  step: { label?: string; selector?: string; xpath?: string; nearText?: string },
+  step: { xpath?: string },
   ctx: ExecutionContext,
 ): Locator {
-  const out: Locator = {};
-  if (step.label) out.label = substitute(step.label, ctx);
-  if (step.selector) out.selector = substitute(step.selector, ctx);
-  if (step.xpath) out.xpath = substitute(step.xpath, ctx);
-  if (step.nearText) out.nearText = substitute(step.nearText, ctx);
-  if (!out.label && !out.selector && !out.xpath) {
-    throw new Error('Step requires "label", "selector", or "xpath"');
+  if (!step.xpath) {
+    throw new Error('Step requires "xpath"');
   }
-  return out;
+  return { xpath: substituteXPath(step.xpath, ctx) };
 }

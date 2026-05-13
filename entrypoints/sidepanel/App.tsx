@@ -17,13 +17,13 @@ const TABS: { id: AutomationTag; label: string }[] = [
 
 const PLACEHOLDERS: Record<AutomationTag, string> = {
   action: '{ "steps": [ { "action": "goto", "url": "..." } ] }',
-  get: '{ "action": "get", "selector": "h1", "saveAs": "title" }',
+  get: '{ "action": "get", "xpath": "//h1", "saveAs": "title" }',
 };
 
 const HINTS: Record<AutomationTag, string> = {
   action:
-    'Accepts a full script, a bare array, or a single step. Comments and trailing commas OK.',
-  get: 'Reads attribute, property, or value. Optional regex extracts a match.',
+    'XPath locator. Accepts a full script, a bare array, or a single step. Comments and trailing commas OK.',
+  get: 'XPath locator. Reads attribute, property, or value. Optional regex extracts a match.',
 };
 
 export function App() {

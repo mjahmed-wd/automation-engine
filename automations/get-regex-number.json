@@ -1,11 +1,11 @@
 {
   "name": "Get first big number on page (regex)",
-  "description": "Reads the page's visible text and extracts the first number with 3+ digits via regex. Demonstrates regex filtering.",
+  "description": "Reads body innerText and extracts the first number with 3+ digits via regex.",
   "tag": "get",
   "steps": [
     {
       "action": "get",
-      "selector": "body",
+      "xpath": "//body",
       "property": "innerText",
       "regex": "(\\d{3,}(?:[,.]\\d+)*)",
       "saveAs": "firstNumber"

@@ -1,12 +1,16 @@
 {
-  "name": "Paylowpro: Fill First Name",
-  "description": "Navigates to paylowpro.com and types into the First Name field in the Zoho iframe.",
+  "name": "Paylowpro: Fill First Name (XPath)",
+  "description": "Navigates to paylowpro.com and types into the First Name field in the Zoho form iframe. Uses XPath to anchor on the label text — no dependency on auto-generated input ids.",
   "tag": "action",
   "variables": {
     "firstName": "Md. jubair"
   },
   "steps": [
     { "action": "goto", "url": "https://www.paylowpro.com/" },
-    { "action": "fill", "label": "First Name", "value": "{{firstName}}" }
+    {
+      "action": "fill",
+      "xpath": "//label[contains(., 'First Name')]/following::input[1]",
+      "value": "{{firstName}}"
+    }
   ]
 }

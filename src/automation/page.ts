@@ -2,27 +2,28 @@
  * Page — a thin CDP client bound to a Chrome tab.
  *
  * Wraps chrome.debugger.attach + Target.setAutoAttach (legacy flatten:false
- * mode) so that we can address out-of-process iframes (OOPIFs) via
+ * mode) so that we can address out-of-process iframes via
  * Target.sendMessageToTarget / Target.receivedMessageFromTarget.
  *
  * Exposes high-level methods (`goto`, `fill`, `get`, `click`, `waitFor`).
- * Internally each action runs in two phases:
+ * Each action runs in two phases:
  *
  *   1. Fast path — a single `Runtime.evaluate` that finds + acts atomically.
- *      Covers the light DOM, open shadow roots, and the explicit `>>>`
- *      syntax. Runs on the main page first, then each attached iframe.
+ *      Walks the document via document.evaluate and recurses into open
+ *      shadow roots. Runs on the main page first, then each attached iframe.
  *
- *   2. CDP fallback — `DOM.getDocument({pierce: true})` exposes every shadow
- *      root including closed ones. We walk the tree, run `DOM.querySelector`
- *      against each shadow root, resolve the matching node, and use
- *      `Runtime.callFunctionOn` to perform the action. Only kicks in if the
- *      fast path turned up nothing. Selector-based locators only.
+ *   2. CDP fallback — `DOM.performSearch` understands XPath natively and
+ *      traverses every shadow root including closed ones. We get a nodeId,
+ *      `DOM.resolveNode` for a Runtime.RemoteObject, then
+ *      `Runtime.callFunctionOn` to perform the action. Triggered when the
+ *      fast path turns up nothing, or eagerly when `pierceClosed: true`.
  */
 
 import type { Locator, LogFn } from './schema';
 import {
   buildActionExpression,
   buildCallFunctionExpression,
+  buildResolveExpression,
   type GetOptions,
   type Mode,
 } from './locator';
@@ -40,15 +41,6 @@ export interface FrameResult {
   tag?: string;
   name?: string;
   inputs?: number;
-}
-
-interface CdpNode {
-  nodeId: number;
-  nodeName?: string;
-  shadowRoots?: CdpNode[];
-  shadowRootType?: string;
-  children?: CdpNode[];
-  contentDocument?: CdpNode;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -94,9 +86,7 @@ export class Page {
     chrome.debugger.onEvent.addListener(this.listener);
 
     await this.sendCmd(this.tabTarget, 'Runtime.enable');
-    await this.sendCmd(this.tabTarget, 'DOM.enable').catch(() => {
-      /* may already be enabled */
-    });
+    await this.sendCmd(this.tabTarget, 'DOM.enable').catch(() => {});
     await this.sendCmd(this.tabTarget, 'Target.setAutoAttach', {
       autoAttach: true,
       waitForDebuggerOnStart: false,
@@ -139,9 +129,7 @@ export class Page {
         waitForDebuggerOnStart: false,
         flatten: false,
       });
-    } catch {
-      /* may already be detached */
-    }
+    } catch {}
     await new Promise<void>((r) =>
       chrome.debugger.detach(this.tabTarget, () => {
         void chrome.runtime.lastError;
@@ -154,6 +142,18 @@ export class Page {
   // ---------- high-level actions ----------
 
   async goto(url: string): Promise<void> {
+    // Short-circuit when we're already on the target URL — saves a redundant
+    // reload after the chrome:// pre-flight in background.ts, and lets users
+    // re-run scripts without paying the load cost again.
+    try {
+      const current = await chrome.tabs.get(this.tabId);
+      if (current.url === url && current.status === 'complete') {
+        this.log('info', `Already at ${url}, skipping navigation.`);
+        return;
+      }
+    } catch {
+      /* tab gone — fall through to update, which will fail loudly */
+    }
     this.log('info', `Navigating to ${url}…`);
     await chrome.tabs.update(this.tabId, { url, active: true });
     await this.waitForLoad(30_000);
@@ -180,7 +180,115 @@ export class Page {
     locator: Locator,
     opts: { pierceClosed?: boolean } = {},
   ): Promise<FrameResult> {
-    return this.runAction(locator, 'click', {}, undefined, opts.pierceClosed);
+    await this.validateXPath(locator.xpath);
+
+    // pierceClosed targets are inside closed shadow roots — resolve via CDP
+    // DOM walk, then trusted-click at the resolved coordinates.
+    if (opts.pierceClosed) {
+      this.log('info', 'pierceClosed=true — CDP-resolving and trusted-clicking.');
+      return this.cdpTrustedClick(locator);
+    }
+
+    // Fast path: resolve coords via Runtime.evaluate (also walks open shadow
+    // roots + same-origin iframes). For main-frame matches, dispatch trusted
+    // mouse events through CDP Input — needed for any library that gates on
+    // event.isTrusted (react-select, MUI Select, etc.). For iframe matches,
+    // viewport coords aren't directly translatable, so fall back to the
+    // synthetic pointer-sequence click.
+    const resolveExpr = buildResolveExpression(locator);
+    let resolved: any;
+    try {
+      resolved = await this.runUntilFound(resolveExpr, DEFAULT_SEARCH_TIMEOUT_MS);
+    } catch (fastErr) {
+      this.log('info', 'Fast-path resolve missed — trying CDP DOM walk.');
+      try {
+        return await this.cdpTrustedClick(locator);
+      } catch {
+        throw fastErr;
+      }
+    }
+
+    if (resolved?.isMain === true && typeof resolved.x === 'number') {
+      await this.dispatchTrustedClick(resolved.x, resolved.y);
+      this.log(
+        'success',
+        `Clicked ${resolved.tag ?? 'element'} (trusted) at (${Math.round(
+          resolved.x,
+        )}, ${Math.round(resolved.y)}) in ${resolved.frame}`,
+      );
+      return { ok: true, frame: resolved.frame, tag: resolved.tag, name: resolved.name };
+    }
+
+    // Iframe element — synthetic click via the existing pointer sequence.
+    this.log(
+      'info',
+      `Click target in iframe ${resolved?.frame ?? ''} — using synthetic pointer-sequence.`,
+    );
+    return this.runUntilFound(buildActionExpression(locator, 'click'), DEFAULT_SEARCH_TIMEOUT_MS);
+  }
+
+  /** Resolve the element via CDP, scroll it into view, then trusted-click. */
+  private async cdpTrustedClick(locator: Locator): Promise<FrameResult> {
+    const send = (m: string, p?: Record<string, unknown>) =>
+      this.sendCmd(this.tabTarget, m, p);
+    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
+    if (!nodeId) {
+      throw new Error(`No match found for '${locator.xpath}' via CDP DOM walk.`);
+    }
+
+    // Scroll into view via callFunctionOn on the resolved object.
+    const resolved = await send('DOM.resolveNode', { nodeId });
+    const objectId = resolved?.object?.objectId;
+    if (objectId) {
+      try {
+        await send('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration:
+            'function () { this.scrollIntoView({ block: "center", inline: "center" }); }',
+        });
+      } finally {
+        await send('Runtime.releaseObject', { objectId }).catch(() => {});
+      }
+    }
+
+    const box = await send('DOM.getBoxModel', { nodeId });
+    const content = box?.model?.content as number[] | undefined;
+    if (!content || content.length < 8) {
+      throw new Error('Element has no box model (zero-size or detached).');
+    }
+    const x = (content[0] + content[4]) / 2;
+    const y = (content[1] + content[5]) / 2;
+    await this.dispatchTrustedClick(x, y);
+    this.log(
+      'success',
+      `Clicked (trusted, CDP-resolved) at (${Math.round(x)}, ${Math.round(y)}).`,
+    );
+    return { ok: true, frame: '' };
+  }
+
+  /** Send a trusted left-click at (x, y) in the tab's viewport coordinates. */
+  private async dispatchTrustedClick(x: number, y: number): Promise<void> {
+    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x,
+      y,
+    });
+    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x,
+      y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x,
+      y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
   }
 
   async waitFor(
@@ -190,11 +298,6 @@ export class Page {
     return this.runAction(locator, 'find', {}, opts.timeoutMs, opts.pierceClosed);
   }
 
-  /**
-   * Run an action with the fast path first, then the CDP fallback when the
-   * fast path returns nothing. If `pierceClosed` is true, skip the fast path
-   * and go straight to the CDP DOM-walk.
-   */
   private async runAction(
     locator: Locator,
     mode: Mode,
@@ -202,11 +305,10 @@ export class Page {
     timeoutMs?: number,
     pierceClosed?: boolean,
   ): Promise<FrameResult> {
-    const cdpCapable = !!(locator.selector || locator.xpath);
+    // Surface XPath syntax errors loudly before the 20-second search timeout.
+    await this.validateXPath(locator.xpath);
 
-    // Opt-in shortcut: if the caller knows the target is in a closed shadow
-    // root, skip the fast path entirely.
-    if (pierceClosed && cdpCapable) {
+    if (pierceClosed) {
       this.log('info', 'pierceClosed=true — going straight to CDP DOM walk.');
       return await this.cdpFindAndAct(locator, mode, opts);
     }
@@ -219,19 +321,11 @@ export class Page {
       fastErr = err as Error;
     }
 
-    // Fast path failed. Try the CDP DOM-domain fallback — covers closed
-    // shadow roots that the fast path can't see. Only meaningful for
-    // selector/xpath locators; labels stay on the fast path.
-    if (!cdpCapable) throw fastErr;
-
     this.log('info', 'Fast path missed — trying CDP DOM walk for closed shadow roots…');
     try {
       return await this.cdpFindAndAct(locator, mode, opts);
     } catch (cdpErr: any) {
-      this.log(
-        'info',
-        `CDP fallback also failed: ${cdpErr?.message ?? cdpErr}`,
-      );
+      this.log('info', `CDP fallback also failed: ${cdpErr?.message ?? cdpErr}`);
       throw fastErr;
     }
   }
@@ -252,16 +346,12 @@ export class Page {
       if (typeof main?.inputs === 'number') maxInputs = Math.max(maxInputs, main.inputs);
 
       for (const [sessionId, info] of this.childSessions) {
-        // Workers/worklets/service workers don't have DOM — skip them so we
-        // don't log noise like "document is not defined".
         if (!isDomTarget(info?.type)) continue;
         if (!runtimeEnabled.has(sessionId)) {
           try {
             await this.sendToChild(sessionId, 'Runtime.enable');
             runtimeEnabled.add(sessionId);
-          } catch {
-            /* page may still be loading */
-          }
+          } catch {}
         }
         try {
           const res = await this.sendToChild<any>(sessionId, 'Runtime.evaluate', {
@@ -298,16 +388,14 @@ export class Page {
     }
   }
 
-  // ---------- CDP fallback: DOM domain walks closed shadow roots ----------
+  // ---------- CDP fallback: DOM.performSearch with XPath ----------
 
   private async cdpFindAndAct(
     locator: Locator,
     mode: Mode,
     opts: { value?: string } & GetOptions,
   ): Promise<FrameResult> {
-    // Try main target.
     const mainResult = await this.cdpFindAndActOnTarget(
-      this.tabTarget,
       (m, p) => this.sendCmd(this.tabTarget, m, p),
       locator,
       mode,
@@ -315,8 +403,6 @@ export class Page {
     );
     if (mainResult) return mainResult;
 
-    // Then each child session — iframes only. Workers/worklets/etc don't
-    // have DOM.enable so DOM walks against them are pointless and noisy.
     for (const [sessionId, info] of this.childSessions) {
       if (!isDomTarget(info?.type)) continue;
       try {
@@ -325,7 +411,6 @@ export class Page {
           this.cdpReadyChildren.add(sessionId);
         }
         const res = await this.cdpFindAndActOnTarget(
-          this.tabTarget,
           (m, p) => this.sendToChild(sessionId, m, p),
           locator,
           mode,
@@ -343,25 +428,16 @@ export class Page {
     throw new Error('No match found via CDP DOM walk.');
   }
 
-  /** One target's worth of "find a nodeId then call function on it". */
+  /** Find a nodeId by XPath, then call the action function on it. */
   private async cdpFindAndActOnTarget(
-    _root: Target,
     send: (method: string, params?: Record<string, unknown>) => Promise<any>,
     locator: Locator,
     mode: Mode,
     opts: { value?: string } & GetOptions,
   ): Promise<FrameResult | null> {
-    let nodeId: number | null = null;
-    if (locator.xpath) {
-      nodeId = await this.cdpResolveXPath(send, locator.xpath);
-    } else if (locator.selector && locator.nearText) {
-      nodeId = await this.cdpResolveNearText(send, locator.selector, locator.nearText);
-    } else if (locator.selector) {
-      nodeId = await this.cdpResolveSelector(send, locator.selector);
-    }
+    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
     if (!nodeId) return null;
 
-    // Resolve the node to a JS remote object so we can run a function on it.
     let objectId: string | undefined;
     try {
       const resolved = await send('DOM.resolveNode', { nodeId });
@@ -382,8 +458,7 @@ export class Page {
             'callFunctionOn failed',
         );
       }
-      const value = result?.result?.value as FrameResult | undefined;
-      return value ?? null;
+      return (result?.result?.value as FrameResult | undefined) ?? null;
     } finally {
       if (objectId) {
         await send('Runtime.releaseObject', { objectId }).catch(() => {});
@@ -392,61 +467,8 @@ export class Page {
   }
 
   /**
-   * Resolve a (possibly `>>>`-piercing) selector to a single nodeId on the
-   * given target. Walks every shadow root returned by DOM.getDocument with
-   * pierce:true, so closed shadows are reachable.
-   */
-  private async cdpResolveSelector(
-    send: (method: string, params?: Record<string, unknown>) => Promise<any>,
-    selector: string,
-  ): Promise<number | null> {
-    const hops = selector.includes('>>>')
-      ? selector.split('>>>').map((s) => s.trim()).filter(Boolean)
-      : null;
-
-    const docResp = await send('DOM.getDocument', { depth: -1, pierce: true });
-    const root: CdpNode | undefined = docResp?.root;
-    if (!root) return null;
-
-    if (hops && hops.length > 0) {
-      // Explicit hop-by-hop: querySelector each segment against the previous
-      // element's shadow root.
-      let scopeId: number = root.nodeId;
-      for (let i = 0; i < hops.length; i++) {
-        const r = await send('DOM.querySelector', { nodeId: scopeId, selector: hops[i] });
-        const nodeId: number = r?.nodeId ?? 0;
-        if (!nodeId) return null;
-        if (i === hops.length - 1) return nodeId;
-        const desc = await send('DOM.describeNode', {
-          nodeId,
-          depth: 1,
-          pierce: true,
-        });
-        const sr = desc?.node?.shadowRoots?.[0];
-        if (!sr?.nodeId) return null;
-        scopeId = sr.nodeId;
-      }
-      return null;
-    }
-
-    // Auto-pierce: collect every shadow root in the tree, run querySelector
-    // at each one. First hit wins.
-    const roots: number[] = [root.nodeId];
-    collectShadowRoots(root, roots);
-    for (const nodeId of roots) {
-      try {
-        const r = await send('DOM.querySelector', { nodeId, selector });
-        if (r?.nodeId) return r.nodeId as number;
-      } catch {
-        /* querySelector against a detached node throws — keep going */
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Resolve an XPath expression via `DOM.performSearch`, which natively
-   * understands XPath and traverses every shadow root, including closed ones.
+   * Resolve an XPath via `DOM.performSearch`, which understands XPath natively
+   * and traverses every shadow root, including closed ones.
    */
   private async cdpResolveXPath(
     send: (method: string, params?: Record<string, unknown>) => Promise<any>,
@@ -476,61 +498,25 @@ export class Page {
   }
 
   /**
-   * Resolve `selector + nearText`: walk the full DOM (incl. shadow roots),
-   * find every element whose own direct text content matches `nearText`, then
-   * for each one walk up to 6 ancestor levels calling `DOM.querySelector(...,
-   * selector)`. First hit wins. Works for closed shadow roots because we read
-   * the tree via DOM.getDocument({pierce:true}).
+   * Validate an XPath expression up-front. Without this the fast path runs to
+   * its full 20-second timeout on a typo and the user sees a vague "Locator
+   * not found" — this turns it into "Bad XPath: …".
    */
-  private async cdpResolveNearText(
-    send: (method: string, params?: Record<string, unknown>) => Promise<any>,
-    selector: string,
-    nearText: string,
-  ): Promise<number | null> {
-    const docResp = await send('DOM.getDocument', { depth: -1, pierce: true });
-    const root: CdpNode | undefined = docResp?.root;
-    if (!root) return null;
-
-    // Pattern: a relaxed-whitespace, case-insensitive match.
-    const pattern = new RegExp(
-      nearText.trim().replace(/\s+/g, '\\s*').replace(/[.*+?^${}()|[\]\\]/g, (m) => m),
-      'i',
-    );
-
-    // Walk tree, build parent map, collect text-bearing elements.
-    const parentOf = new Map<number, number>();
-    const candidates: number[] = [];
-
-    const visit = (n: any, parentId: number) => {
-      if (n.nodeId != null) parentOf.set(n.nodeId, parentId);
-      // CDP nodeType 1 = ELEMENT_NODE. Check the element's *direct* text by
-      // summing nodeValue of immediate text-node children.
-      if (n.nodeType === 1 && Array.isArray(n.children)) {
-        let direct = '';
-        for (const c of n.children) {
-          if (c.nodeType === 3 && typeof c.nodeValue === 'string') direct += c.nodeValue;
-        }
-        if (direct && pattern.test(direct)) candidates.push(n.nodeId);
+  private async validateXPath(xpath: string): Promise<void> {
+    try {
+      const res = await this.sendCmd<any>(this.tabTarget, 'Runtime.evaluate', {
+        expression:
+          `(() => { try { document.createExpression(${JSON.stringify(xpath)}); return null; } ` +
+          `catch (e) { return e.message || String(e); } })()`,
+        returnByValue: true,
+      });
+      const errMsg = res?.result?.value;
+      if (errMsg) {
+        throw new Error(`Bad XPath: ${errMsg} — '${xpath}'`);
       }
-      if (Array.isArray(n.children)) for (const c of n.children) visit(c, n.nodeId);
-      if (Array.isArray(n.shadowRoots)) for (const sr of n.shadowRoots) visit(sr, n.nodeId);
-      if (n.contentDocument) visit(n.contentDocument, n.nodeId);
-    };
-    visit(root, -1);
-
-    for (const startId of candidates) {
-      let cur: number | undefined = parentOf.get(startId);
-      for (let d = 0; d < 6 && cur != null && cur !== -1; d++) {
-        try {
-          const r = await send('DOM.querySelector', { nodeId: cur, selector });
-          if (r?.nodeId) return r.nodeId as number;
-        } catch {
-          /* unreachable; keep walking */
-        }
-        cur = parentOf.get(cur);
-      }
+    } catch (err: any) {
+      if (err?.message?.startsWith('Bad XPath')) throw err;
     }
-    return null;
   }
 
   // ---------- chrome.debugger plumbing ----------
@@ -559,7 +545,6 @@ export class Page {
     });
   }
 
-  /** Send a CDP command to a child session via the legacy envelope. */
   private sendToChild<T = any>(
     sessionId: string,
     method: string,
@@ -622,22 +607,4 @@ export class Page {
 /** True if a child target's type can run DOM/Runtime evaluation. */
 function isDomTarget(type: string | undefined): boolean {
   return type === 'iframe' || type === 'page';
-}
-
-/** Walks a CDP DOM tree node, pushing every shadow-root nodeId into `out`. */
-function collectShadowRoots(node: CdpNode, out: number[]): void {
-  if (node.shadowRoots) {
-    for (const sr of node.shadowRoots) {
-      out.push(sr.nodeId);
-      collectShadowRoots(sr, out);
-    }
-  }
-  if (node.contentDocument) {
-    // Iframes nested inside the main document — for OOPIFs this is empty;
-    // same-origin iframes show their inner tree here.
-    collectShadowRoots(node.contentDocument, out);
-  }
-  if (node.children) {
-    for (const c of node.children) collectShadowRoots(c, out);
-  }
 }

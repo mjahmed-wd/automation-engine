@@ -13,6 +13,7 @@ import {
   listAutomations,
   parseAutomation,
   runScript,
+  substituteRaw,
   type ExecutionContext,
   type LogFn,
 } from '@/src/automation';
@@ -42,10 +43,46 @@ export default defineBackground(() => {
 const broadcastLog: LogFn = (level, message) => {
   if (level === 'error') console.error('[automation]', message);
   else console.log('[automation]', message);
-  chrome.runtime.sendMessage({ type: 'log', level, message }).catch(() => {
-    /* sidepanel may be closed */
-  });
+  chrome.runtime.sendMessage({ type: 'log', level, message }).catch(() => {});
 };
+
+/** Browser-internal URLs that chrome.debugger.attach() refuses to touch. */
+function isAttachable(url: string | undefined): boolean {
+  if (!url) return false;
+  return !(
+    url.startsWith('chrome://') ||
+    url.startsWith('chrome-extension://') ||
+    url.startsWith('edge://') ||
+    url.startsWith('brave://') ||
+    url.startsWith('about:') ||
+    url.startsWith('devtools://')
+  );
+}
+
+/** Wait until tab.status === 'complete', up to timeoutMs. */
+function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('Timed out waiting for tab to load'));
+    }, timeoutMs);
+    const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
+      if (id === tabId && info.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((t) => {
+      if (t.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    });
+  });
+}
 
 async function runJsonAutomation(
   json: string,
@@ -59,6 +96,33 @@ async function runJsonAutomation(
   else query.lastFocusedWindow = true;
   const [tab] = await chrome.tabs.query(query);
   if (!tab?.id) throw new Error('Could not find an active tab');
+
+  // Pre-flight: chrome.debugger.attach() refuses chrome://, chrome-extension://,
+  // about:blank, etc. If the script starts with `goto`, navigate the tab via
+  // the regular tabs API first (no debugger needed), then attach.
+  if (!isAttachable(tab.url)) {
+    const first = script.steps[0];
+    if (first && first.action === 'goto' && (first as any).url) {
+      const preCtx: ExecutionContext = {
+        variables: { ...(script.variables ?? {}) },
+        outputs: {},
+        log: broadcastLog,
+      };
+      const targetUrl = substituteRaw((first as any).url, preCtx);
+      broadcastLog(
+        'info',
+        `Tab is on ${tab.url ?? 'an internal page'} — pre-navigating to ${targetUrl} before attach.`,
+      );
+      await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
+      await waitForTabComplete(tab.id, 30_000);
+    } else {
+      throw new Error(
+        `Cannot run automation on ${tab.url ?? 'this page'} — Chrome blocks debugger access to ` +
+          `chrome:// / chrome-extension:// / about: URLs. Either navigate to a normal site first, ` +
+          `or start your script with a "goto" step.`,
+      );
+    }
+  }
 
   const ctx: ExecutionContext = {
     variables: {},
