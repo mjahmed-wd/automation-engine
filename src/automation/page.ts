@@ -211,31 +211,48 @@ export class Page {
 
   // ---------- high-level actions ----------
 
-  async goto(url: string): Promise<void> {
+  async goto(
+    url: string,
+    opts: { waitForXPath?: string; waitForTimeoutMs?: number } = {},
+  ): Promise<void> {
     // Short-circuit when we're already on the target URL — saves a redundant
     // reload after the chrome:// pre-flight in background.ts, and lets users
     // re-run scripts without paying the load cost again.
+    let alreadyThere = false;
     try {
       const current = await chrome.tabs.get(this.tabId);
-      if (current.url === url && current.status === 'complete') {
-        this.log('info', `Already at ${url}, skipping navigation.`);
-        // Even on a no-op navigation, re-check shadow state — the page might
-        // have rendered different content since the previous detection.
-        this.hasClosedShadow = false;
-        await this.detectClosedShadow();
-        return;
-      }
+      alreadyThere = current.url === url && current.status === 'complete';
     } catch {
       /* tab gone — fall through to update, which will fail loudly */
     }
-    this.log('info', `Navigating to ${url}…`);
-    await chrome.tabs.update(this.tabId, { url, active: true });
-    await this.waitForLoad(30_000);
-    await sleep(500);
-    // New page → new shadow landscape. Reset and re-detect synchronously so
-    // the next action sees the correct flag.
+
+    if (alreadyThere) {
+      this.log('info', `Already at ${url}, skipping navigation.`);
+    } else {
+      this.log('info', `Navigating to ${url}…`);
+      await chrome.tabs.update(this.tabId, { url, active: true });
+      await this.waitForLoad(30_000);
+      await sleep(500);
+    }
+
+    // New page (or possibly different SPA route on the same URL) → new shadow
+    // landscape. Reset and re-detect synchronously so the next action sees
+    // the correct flag. Runs on both paths so re-runs behave the same as
+    // first runs.
     this.hasClosedShadow = false;
     await this.detectClosedShadow();
+
+    // SPA-aware wait. tabs.onUpdated fires 'complete' on the HTML shell load,
+    // which is too early for React/Vue/Angular pages. If the caller passed a
+    // waitForXPath, block until that element actually exists. Reuses the
+    // standalone waitFor's polling + fast/CDP split + FatalActionError
+    // propagation so behavior is identical to a separate waitFor step.
+    if (opts.waitForXPath) {
+      await this.waitFor(
+        { xpath: opts.waitForXPath },
+        { timeoutMs: opts.waitForTimeoutMs },
+      );
+    }
   }
 
   async fill(
