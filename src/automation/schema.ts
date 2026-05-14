@@ -30,6 +30,8 @@ export interface FillStep extends BaseStep {
   /** Skip the Runtime.evaluate fast path and go straight to the CDP DOM walk
    *  (needed for elements inside `attachShadow({mode:'closed'})` roots). */
   pierceClosed?: boolean;
+  /** Cap how long the locator-search loop polls before failing. Default 20s. */
+  timeoutMs?: number;
 }
 
 /**
@@ -53,12 +55,16 @@ export interface GetStep extends BaseStep {
   regexFlags?: string;
   saveAs?: string;
   pierceClosed?: boolean;
+  /** Cap how long the locator-search loop polls before failing. Default 20s. */
+  timeoutMs?: number;
 }
 
 export interface ClickStep extends BaseStep {
   action: 'click';
   xpath: string;
   pierceClosed?: boolean;
+  /** Cap how long the locator-search loop polls before failing. Default 20s. */
+  timeoutMs?: number;
 }
 
 export interface WaitStep extends BaseStep {
@@ -73,13 +79,32 @@ export interface WaitForStep extends BaseStep {
   pierceClosed?: boolean;
 }
 
+/**
+ * Dispatch a real keyboard event via CDP `Input.dispatchKeyEvent`. Used for
+ * the case where a form is wired to `@keyup.enter` on an input (Vue
+ * convention when there's no `<form>` wrapper), so clicking the visible
+ * submit button is a no-op and the only way to submit is to press Enter
+ * with the input focused.
+ *
+ * `xpath` is optional — if provided, the element is focused before the
+ * keystroke; if omitted, the keystroke goes to whatever has focus already
+ * (typically the input most recently `fill`ed).
+ */
+export interface PressStep extends BaseStep {
+  action: 'press';
+  xpath?: string;
+  key: string;
+  pierceClosed?: boolean;
+}
+
 export type AutomationStep =
   | GotoStep
   | FillStep
   | GetStep
   | ClickStep
   | WaitStep
-  | WaitForStep;
+  | WaitForStep
+  | PressStep;
 
 /** Tag identifies which sidepanel tab a script's example belongs in. */
 export type AutomationTag = 'action' | 'get';

@@ -93,7 +93,25 @@ export function buildCallFunctionExpression(
   let actionBlock = '';
   if (mode === 'fill') {
     const valueLiteral = JSON.stringify(opts.value ?? '');
+    // Reject disabled / readOnly inputs with fatal:true. The runUntilFound
+    // loop will throw immediately rather than poll for 20s waiting for a
+    // state change that, in practice, only ever flips when the user does
+    // something else first.
     actionBlock = `
+      if (this.disabled || this.readOnly) {
+        var __tag = this.tagName ? this.tagName.toLowerCase() : 'element';
+        var __ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
+        var __why = this.disabled ? 'disabled' : 'read-only';
+        return {
+          ok: false,
+          fatal: true,
+          reason: __why,
+          message: 'Cannot fill ' + __tag + __ident + ': it is ' + __why,
+          frame: location.href,
+          tag: this.tagName,
+          name: this.name || this.id || '',
+        };
+      }
       this.focus();
       const proto = Object.getPrototypeOf(this);
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');
@@ -255,7 +273,23 @@ export function buildActionExpression(
   let actionBlock = '';
   if (mode === 'fill') {
     const valueLiteral = JSON.stringify(opts.value ?? '');
+    // Mirror of the CDP path's disabled/readOnly guard in
+    // buildCallFunctionExpression — keep these two blocks in lockstep.
     actionBlock = `
+      if (el.disabled || el.readOnly) {
+        var __tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+        var __ident = el.name ? '[name="' + el.name + '"]' : (el.id ? '#' + el.id : '');
+        var __why = el.disabled ? 'disabled' : 'read-only';
+        return {
+          ok: false,
+          fatal: true,
+          reason: __why,
+          message: 'Cannot fill ' + __tag + __ident + ': it is ' + __why,
+          frame: location.href,
+          tag: el.tagName,
+          name: el.name || el.id || '',
+        };
+      }
       el.focus();
       const proto = Object.getPrototypeOf(el);
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');

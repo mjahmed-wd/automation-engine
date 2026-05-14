@@ -13,6 +13,7 @@ import { getAction } from './get';
 import { clickAction } from './click';
 import { waitAction } from './wait';
 import { waitForAction } from './waitFor';
+import { pressAction } from './press';
 
 export type ActionHandler = (
   step: any,
@@ -27,6 +28,7 @@ export const actions: Record<AutomationStep['action'], ActionHandler> = {
   click: clickAction,
   wait: waitAction,
   waitFor: waitForAction,
+  press: pressAction,
 };
 
 export function resolveAction(name: string): ActionHandler | undefined {

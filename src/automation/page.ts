@@ -48,6 +48,30 @@ export interface FrameResult {
   tag?: string;
   name?: string;
   inputs?: number;
+  /**
+   * Found-but-rejected signal. When `true`, the locator matched an element but
+   * we refuse to act on it (e.g., fill target is `disabled` / `readOnly`, or in
+   * Batch 3 a click target is overlay-covered). The search loop stops polling
+   * immediately and surfaces `message` to the user.
+   */
+  fatal?: boolean;
+  /** Short tag for the rejection, e.g. `'disabled'`, `'read-only'`, `'covered'`. */
+  reason?: string;
+  /** Human-readable error built in-page so the loop can throw it verbatim. */
+  message?: string;
+}
+
+/**
+ * Thrown when the in-page function signals `fatal:true`. We use a typed error
+ * so `runAction` can distinguish "didn't find it, try CDP" from "found it but
+ * the page state forbids the action — stop searching."
+ */
+export class FatalActionError extends Error {
+  readonly fatal = true as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'FatalActionError';
+  }
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -217,24 +241,25 @@ export class Page {
   async fill(
     locator: Locator,
     value: string,
-    opts: { pierceClosed?: boolean } = {},
+    opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<FrameResult> {
-    return this.runAction(locator, 'fill', { value }, undefined, opts.pierceClosed);
+    return this.runAction(locator, 'fill', { value }, opts.timeoutMs, opts.pierceClosed);
   }
 
   async get(
     locator: Locator,
-    opts: GetOptions & { pierceClosed?: boolean } = {},
+    opts: GetOptions & { pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<FrameResult> {
-    const { pierceClosed, ...getOpts } = opts;
-    return this.runAction(locator, 'get', getOpts, undefined, pierceClosed);
+    const { pierceClosed, timeoutMs, ...getOpts } = opts;
+    return this.runAction(locator, 'get', getOpts, timeoutMs, pierceClosed);
   }
 
   async click(
     locator: Locator,
-    opts: { pierceClosed?: boolean } = {},
+    opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<FrameResult> {
     await this.validateXPath(locator.xpath);
+    const timeout = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
 
     // Three-state pierceClosed: explicit true/false overrides; undefined
     // consults the auto-detected hasClosedShadow flag.
@@ -265,8 +290,11 @@ export class Page {
     let resolved: any;
     let result: FrameResult;
     try {
-      resolved = await this.runUntilFound(resolveExpr, DEFAULT_SEARCH_TIMEOUT_MS);
+      resolved = await this.runUntilFound(resolveExpr, timeout);
     } catch (fastErr) {
+      // Click can't produce fatal in Batch 1, but stay symmetric with fill so
+      // Batch 3's overlay check propagates correctly without revisiting this.
+      if (fastErr instanceof FatalActionError) throw fastErr;
       this.log('info', 'Fast-path resolve missed — trying CDP DOM walk.');
       try {
         result = await this.cdpTrustedClick(locator);
@@ -296,7 +324,7 @@ export class Page {
       );
       result = await this.runUntilFound(
         buildActionExpression(locator, 'click'),
-        DEFAULT_SEARCH_TIMEOUT_MS,
+        timeout,
       );
     }
 
@@ -385,6 +413,57 @@ export class Page {
     return result;
   }
 
+  /**
+   * Dispatch a trusted keyboard event via CDP `Input.dispatchKeyEvent`. If a
+   * locator is given, the element is focused first (CDP-resolved so it works
+   * inside closed shadow roots); otherwise the keystroke goes to whatever has
+   * focus already. Used for Vue forms wired to `@keyup.enter` on an input,
+   * where clicking the visible submit button doesn't trigger submit (no
+   * `<form>` wrapper).
+   */
+  async press(
+    locator: Locator | null,
+    key: string,
+    opts: { pierceClosed?: boolean } = {},
+  ): Promise<void> {
+    if (locator) {
+      await this.validateXPath(locator.xpath);
+      const send = (m: string, p?: Record<string, unknown>) =>
+        this.sendCmd(this.tabTarget, m, p);
+      const nodeId = await this.cdpResolveXPath(send, locator.xpath);
+      if (!nodeId) {
+        throw new Error(`Press: no match for '${locator.xpath}' via CDP DOM walk.`);
+      }
+      const resolved = await send('DOM.resolveNode', { nodeId });
+      const objectId = resolved?.object?.objectId;
+      if (objectId) {
+        try {
+          await send('Runtime.callFunctionOn', {
+            objectId,
+            functionDeclaration:
+              'function () { if (typeof this.focus === "function") this.focus(); }',
+          });
+        } finally {
+          await send('Runtime.releaseObject', { objectId }).catch(() => {});
+        }
+      }
+      // pierceClosed is accepted for parity with other actions but isn't
+      // structurally needed here — cdpResolveXPath already pierces.
+      void opts.pierceClosed;
+    }
+
+    const params = mapKeyToCdp(key);
+    await this.sendCmd(this.tabTarget, 'Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      ...params,
+    });
+    await this.sendCmd(this.tabTarget, 'Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      ...params,
+    });
+    this.log('success', `Pressed "${key}".`);
+  }
+
   private async runAction(
     locator: Locator,
     mode: Mode,
@@ -418,6 +497,8 @@ export class Page {
     try {
       return await this.runUntilFound(expression, timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS);
     } catch (err) {
+      // Found-but-rejected — CDP won't change the verdict. Re-throw now.
+      if (err instanceof FatalActionError) throw err;
       fastErr = err as Error;
     }
 
@@ -425,6 +506,7 @@ export class Page {
     try {
       return await this.cdpFindAndAct(locator, mode, opts);
     } catch (cdpErr: any) {
+      if (cdpErr instanceof FatalActionError) throw cdpErr;
       this.log('info', `CDP fallback also failed: ${cdpErr?.message ?? cdpErr}`);
       throw fastErr;
     }
@@ -443,6 +525,13 @@ export class Page {
     while (Date.now() - start < timeoutMs) {
       const main = await this.evalSafe(this.tabTarget, expression);
       if (main?.ok) return main;
+      // Found-but-rejected (disabled input, etc.). Bail out of the poll loop
+      // immediately — no amount of waiting will change the verdict.
+      if (main?.fatal) {
+        throw new FatalActionError(
+          main.message ?? `Action rejected: ${main.reason ?? 'unknown'}`,
+        );
+      }
       if (typeof main?.inputs === 'number') maxInputs = Math.max(maxInputs, main.inputs);
 
       for (const [sessionId, info] of this.childSessions) {
@@ -461,8 +550,14 @@ export class Page {
           });
           const value = res.result?.value as FrameResult | undefined;
           if (value?.ok) return value;
+          if (value?.fatal) {
+            throw new FatalActionError(
+              value.message ?? `Action rejected: ${value.reason ?? 'unknown'}`,
+            );
+          }
           if (typeof value?.inputs === 'number') maxInputs = Math.max(maxInputs, value.inputs);
         } catch (err: any) {
+          if (err instanceof FatalActionError) throw err;
           this.log('info', `Frame ${info?.url ?? sessionId}: ${err?.message ?? err}`);
         }
       }
@@ -521,6 +616,7 @@ export class Page {
           return res;
         }
       } catch (err: any) {
+        if (err instanceof FatalActionError) throw err;
         this.log('info', `CDP on ${info?.type ?? 'child'} ${info?.url ?? sessionId}: ${err?.message ?? err}`);
       }
     }
@@ -558,7 +654,15 @@ export class Page {
             'callFunctionOn failed',
         );
       }
-      return (result?.result?.value as FrameResult | undefined) ?? null;
+      const out = (result?.result?.value as FrameResult | undefined) ?? null;
+      // Mirror runUntilFound: a CDP-resolved match that returns fatal:true
+      // means "found but state-rejected" — bubble it past the frame loop.
+      if (out?.fatal) {
+        throw new FatalActionError(
+          out.message ?? `Action rejected: ${out.reason ?? 'unknown'}`,
+        );
+      }
+      return out;
     } finally {
       if (objectId) {
         await send('Runtime.releaseObject', { objectId }).catch(() => {});
@@ -907,6 +1011,45 @@ function anyClosedShadow(node: any): boolean {
 
 function isDomTarget(type: string | undefined): boolean {
   return type === 'iframe' || type === 'page';
+}
+
+/**
+ * Map a friendly key name to the params CDP `Input.dispatchKeyEvent` expects.
+ * Covers Enter, Tab, Escape, arrow keys, Backspace, Delete, Space — the keys
+ * an automation actually needs. For anything else we fall back to treating
+ * the key as a single character (best-effort, no synthetic shift handling).
+ */
+function mapKeyToCdp(key: string): {
+  key: string;
+  code: string;
+  windowsVirtualKeyCode?: number;
+  text?: string;
+} {
+  switch (key) {
+    case 'Enter':
+      return { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' };
+    case 'Tab':
+      return { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 };
+    case 'Escape':
+      return { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 };
+    case 'Backspace':
+      return { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 };
+    case 'Delete':
+      return { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 };
+    case 'ArrowDown':
+      return { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 };
+    case 'ArrowUp':
+      return { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 };
+    case 'ArrowLeft':
+      return { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 };
+    case 'ArrowRight':
+      return { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 };
+    case ' ':
+    case 'Space':
+      return { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' };
+    default:
+      return { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, text: key };
+  }
 }
 
 /**

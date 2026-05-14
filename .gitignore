@@ -20,3 +20,9 @@ yarn-error.log*
 !.vscode/extensions.json
 .idea
 .DS_Store
+
+# Local automation examples — kept on disk for personal use, not pushed.
+# The folder itself stays (preserved by .gitkeep) so import.meta.glob in
+# loader.ts has somewhere to scan.
+/automations/*.json
+!/automations/.gitkeep

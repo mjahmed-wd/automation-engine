@@ -1,8 +1,0 @@
-{
-  "name": "Get first link href",
-  "description": "Reads the `href` attribute of the first <a> on the page.",
-  "tag": "get",
-  "steps": [
-    { "action": "get", "xpath": "//a[1]", "attribute": "href", "saveAs": "firstLink" }
-  ]
-}

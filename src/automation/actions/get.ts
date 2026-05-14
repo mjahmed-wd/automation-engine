@@ -10,6 +10,7 @@ export async function getAction(step: GetStep, ctx: ExecutionContext, page: Page
     regex: step.regex,
     regexFlags: step.regexFlags,
     pierceClosed: step.pierceClosed,
+    timeoutMs: step.timeoutMs,
   });
   const value = result.value ?? '';
   if (step.saveAs) ctx.outputs[step.saveAs] = value;

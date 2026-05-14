@@ -1,8 +1,0 @@
-{
-  "name": "Get page title",
-  "description": "Pulls the document <title> tag's text via property:'textContent' since <title> has no on-screen box.",
-  "tag": "get",
-  "steps": [
-    { "action": "get", "xpath": "//title", "property": "textContent", "saveAs": "title" }
-  ]
-}
