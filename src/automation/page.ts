@@ -12,11 +12,18 @@
  *      Walks the document via document.evaluate and recurses into open
  *      shadow roots. Runs on the main page first, then each attached iframe.
  *
- *   2. CDP fallback — `DOM.performSearch` understands XPath natively and
- *      traverses every shadow root including closed ones. We get a nodeId,
- *      `DOM.resolveNode` for a Runtime.RemoteObject, then
- *      `Runtime.callFunctionOn` to perform the action. Triggered when the
+ *   2. CDP fallback — `DOM.getDocument({pierce: true})` returns the full tree
+ *      including closed shadow roots and same-origin iframe documents. We
+ *      collect every Document / ShadowRoot nodeId, `DOM.resolveNode` each to
+ *      a RemoteObject, then `Runtime.callFunctionOn` to run
+ *      `document.evaluate` scoped to that root. First hit wins; we
+ *      `DOM.requestNode` it back to a nodeId, then call the action via
+ *      `Runtime.callFunctionOn` on the resolved object. Triggered when the
  *      fast path turns up nothing, or eagerly when `pierceClosed: true`.
+ *      (We don't use `DOM.performSearch` — it's documented to traverse
+ *      closed shadow roots but in practice returns 0 hits on some real
+ *      sites, e.g. Shepherd's Take Payment page where DevTools Cmd+F
+ *      finds the element fine.)
  */
 
 import type { Locator, LogFn } from './schema';
@@ -55,6 +62,13 @@ export class Page {
     { resolve: (v: any) => void; reject: (e: Error) => void }
   >();
   private readonly cdpReadyChildren = new Set<string>();
+  /**
+   * Auto-detected at attach + after each DOM-mutating action. When `true`,
+   * `runAction` and `click` skip the fast path (which can't see into closed
+   * shadow roots) and go straight to CDP. Users can override with
+   * `pierceClosed: true` (force CDP) or `pierceClosed: false` (force fast path).
+   */
+  private hasClosedShadow = false;
   private nextMsgId = 1;
   private listener?: (
     source: chrome.debugger.Debuggee,
@@ -94,6 +108,38 @@ export class Page {
     });
 
     await sleep(800);
+
+    // Initial closed-shadow detection so we can skip the fast path on pages
+    // like Shepherd that mount closed shadow at load time.
+    await this.detectClosedShadow();
+  }
+
+  /**
+   * One CDP round-trip to check whether the page contains any closed shadow
+   * roots (which the fast-path `document.evaluate` can't see). Cached on the
+   * instance; flips back to false only on `goto`. Re-runs after `click` and
+   * `waitFor` if currently false, so dynamically-mounted closed shadow
+   * (modals, dropdowns, SPA route changes) flips us into CDP mode.
+   */
+  private async detectClosedShadow(): Promise<void> {
+    try {
+      const res = await this.sendCmd<any>(this.tabTarget, 'DOM.getDocument', {
+        depth: -1,
+        pierce: true,
+      });
+      const found = anyClosedShadow(res?.root);
+      if (found !== this.hasClosedShadow) {
+        this.log(
+          'info',
+          found
+            ? 'Closed shadow root detected — XPath actions will use CDP path.'
+            : 'No closed shadow roots — XPath actions back to fast path.',
+        );
+      }
+      this.hasClosedShadow = found;
+    } catch {
+      /* keep previous state on detection failure */
+    }
   }
 
   private onEvent(method: string, params: any) {
@@ -149,6 +195,10 @@ export class Page {
       const current = await chrome.tabs.get(this.tabId);
       if (current.url === url && current.status === 'complete') {
         this.log('info', `Already at ${url}, skipping navigation.`);
+        // Even on a no-op navigation, re-check shadow state — the page might
+        // have rendered different content since the previous detection.
+        this.hasClosedShadow = false;
+        await this.detectClosedShadow();
         return;
       }
     } catch {
@@ -158,6 +208,10 @@ export class Page {
     await chrome.tabs.update(this.tabId, { url, active: true });
     await this.waitForLoad(30_000);
     await sleep(500);
+    // New page → new shadow landscape. Reset and re-detect synchronously so
+    // the next action sees the correct flag.
+    this.hasClosedShadow = false;
+    await this.detectClosedShadow();
   }
 
   async fill(
@@ -182,11 +236,23 @@ export class Page {
   ): Promise<FrameResult> {
     await this.validateXPath(locator.xpath);
 
-    // pierceClosed targets are inside closed shadow roots — resolve via CDP
-    // DOM walk, then trusted-click at the resolved coordinates.
-    if (opts.pierceClosed) {
-      this.log('info', 'pierceClosed=true — CDP-resolving and trusted-clicking.');
-      return this.cdpTrustedClick(locator);
+    // Three-state pierceClosed: explicit true/false overrides; undefined
+    // consults the auto-detected hasClosedShadow flag.
+    const shouldUseCdp =
+      opts.pierceClosed === true ||
+      (opts.pierceClosed !== false && this.hasClosedShadow);
+
+    if (shouldUseCdp) {
+      this.log(
+        'info',
+        opts.pierceClosed === true
+          ? 'pierceClosed=true — CDP-resolving and trusted-clicking.'
+          : 'Closed shadow detected — CDP-resolving and trusted-clicking.',
+      );
+      const out = await this.cdpTrustedClick(locator);
+      // Click may have opened new closed shadow content. We're already in CDP
+      // mode so the flag is true; nothing to re-detect.
+      return out;
     }
 
     // Fast path: resolve coords via Runtime.evaluate (also walks open shadow
@@ -197,15 +263,20 @@ export class Page {
     // synthetic pointer-sequence click.
     const resolveExpr = buildResolveExpression(locator);
     let resolved: any;
+    let result: FrameResult;
     try {
       resolved = await this.runUntilFound(resolveExpr, DEFAULT_SEARCH_TIMEOUT_MS);
     } catch (fastErr) {
       this.log('info', 'Fast-path resolve missed — trying CDP DOM walk.');
       try {
-        return await this.cdpTrustedClick(locator);
+        result = await this.cdpTrustedClick(locator);
       } catch {
         throw fastErr;
       }
+      // Fast path missed but CDP found it — likely a closed shadow root we
+      // hadn't detected yet. Schedule a re-detect to flip the flag.
+      this.detectClosedShadow().catch(() => {});
+      return result;
     }
 
     if (resolved?.isMain === true && typeof resolved.x === 'number') {
@@ -216,15 +287,25 @@ export class Page {
           resolved.x,
         )}, ${Math.round(resolved.y)}) in ${resolved.frame}`,
       );
-      return { ok: true, frame: resolved.frame, tag: resolved.tag, name: resolved.name };
+      result = { ok: true, frame: resolved.frame, tag: resolved.tag, name: resolved.name };
+    } else {
+      // Iframe element — synthetic click via the existing pointer sequence.
+      this.log(
+        'info',
+        `Click target in iframe ${resolved?.frame ?? ''} — using synthetic pointer-sequence.`,
+      );
+      result = await this.runUntilFound(
+        buildActionExpression(locator, 'click'),
+        DEFAULT_SEARCH_TIMEOUT_MS,
+      );
     }
 
-    // Iframe element — synthetic click via the existing pointer sequence.
-    this.log(
-      'info',
-      `Click target in iframe ${resolved?.frame ?? ''} — using synthetic pointer-sequence.`,
-    );
-    return this.runUntilFound(buildActionExpression(locator, 'click'), DEFAULT_SEARCH_TIMEOUT_MS);
+    // Click might have opened a modal / dropdown / SPA route with new closed
+    // shadow. Fire-and-forget re-detect so the next action sees it.
+    if (!this.hasClosedShadow) {
+      this.detectClosedShadow().catch(() => {});
+    }
+    return result;
   }
 
   /** Resolve the element via CDP, scroll it into view, then trusted-click. */
@@ -295,7 +376,13 @@ export class Page {
     locator: Locator,
     opts: { timeoutMs?: number; pierceClosed?: boolean } = {},
   ): Promise<FrameResult> {
-    return this.runAction(locator, 'find', {}, opts.timeoutMs, opts.pierceClosed);
+    const result = await this.runAction(locator, 'find', {}, opts.timeoutMs, opts.pierceClosed);
+    // After a waitFor, page might have rendered new content — including
+    // newly-mounted closed shadow. Re-detect if we haven't already flipped.
+    if (!this.hasClosedShadow) {
+      this.detectClosedShadow().catch(() => {});
+    }
+    return result;
   }
 
   private async runAction(
@@ -308,8 +395,21 @@ export class Page {
     // Surface XPath syntax errors loudly before the 20-second search timeout.
     await this.validateXPath(locator.xpath);
 
-    if (pierceClosed) {
-      this.log('info', 'pierceClosed=true — going straight to CDP DOM walk.');
+    // Three-state pierceClosed:
+    //   true       → always CDP (overrides auto-detection)
+    //   false      → always fast path (overrides auto-detection)
+    //   undefined  → use auto-detected hasClosedShadow flag
+    const shouldUseCdp =
+      pierceClosed === true ||
+      (pierceClosed !== false && this.hasClosedShadow);
+
+    if (shouldUseCdp) {
+      this.log(
+        'info',
+        pierceClosed === true
+          ? 'pierceClosed=true — going straight to CDP DOM walk.'
+          : 'Closed shadow detected — going straight to CDP DOM walk.',
+      );
       return await this.cdpFindAndAct(locator, mode, opts);
     }
 
@@ -467,34 +567,211 @@ export class Page {
   }
 
   /**
-   * Resolve an XPath via `DOM.performSearch`, which understands XPath natively
-   * and traverses every shadow root, including closed ones.
+   * Resolve an XPath against the page, piercing every shadow root (open AND
+   * closed) and same-origin iframe document.
+   *
+   * Strategy (each step is a fallback when the previous can't see closed
+   * shadow content):
+   *
+   *   1. `DOM.getDocument({depth:-1, pierce:true})` — full pierced tree.
+   *   2. Walk the tree collecting Document + ShadowRoot + contentDocument
+   *      nodeIds, plus host->shadow-root lookup keyed by backendNodeId.
+   *   3. For each root, `DOM.resolveNode` → objectId, then
+   *      `Runtime.callFunctionOn` runs:
+   *        a. `document.evaluate(xp, this, …)` (and `.` + xp for non-Document
+   *           contexts) — works inside main doc + open shadows.
+   *        b. For shadow contexts, falls back to parsing the shadow's
+   *           outerHTML into a synthetic doc, running XPath there, and
+   *           path-replaying the result back to the live shadow tree. This
+   *           is what catches Shepherd's closed shadow on the Take Payment
+   *           page, where `document.evaluate` against the live ShadowRoot
+   *           returns null even though the element exists.
+   *   4. First root that returns a hit wins; convert its RemoteObject back
+   *      into a nodeId via `DOM.requestNode`.
+   *
+   * We deliberately avoid `DOM.performSearch` — it's documented to traverse
+   * closed shadow roots but empirically returns 0 hits on Shepherd while
+   * DevTools' Cmd+F finds the same XPath fine.
    */
   private async cdpResolveXPath(
     send: (method: string, params?: Record<string, unknown>) => Promise<any>,
     xpath: string,
   ): Promise<number | null> {
-    const search = await send('DOM.performSearch', {
-      query: xpath,
-      includeUserAgentShadowDOM: false,
-    });
-    const searchId: string | undefined = search?.searchId;
-    const resultCount: number = search?.resultCount ?? 0;
-    if (!searchId || resultCount === 0) {
-      if (searchId) await send('DOM.discardSearchResults', { searchId }).catch(() => {});
+    const doc = await send('DOM.getDocument', { depth: -1, pierce: true });
+    const rootIds: number[] = [];
+    collectRootNodeIds(doc?.root, rootIds);
+    if (rootIds.length === 0) {
+      this.log('info', 'CDP DOM walk: no roots collected from getDocument.');
       return null;
     }
-    try {
-      const res = await send('DOM.getSearchResults', {
-        searchId,
-        fromIndex: 0,
-        toIndex: 1,
-      });
-      const nodeId: number | undefined = res?.nodeIds?.[0];
-      return nodeId ?? null;
-    } finally {
-      await send('DOM.discardSearchResults', { searchId }).catch(() => {});
+
+    // Two-strategy resolver:
+    //  - direct: document.evaluate against the live root (works for main doc
+    //    + open shadow roots).
+    //  - clone: deep-clone the shadow root's children into a hidden holder
+    //    attached to the main document, run XPath there, then replay the
+    //    child-index path back into the live shadow tree. Slower but works
+    //    when Chrome's XPath engine refuses to descend into a closed
+    //    ShadowRoot context. We use cloneNode(true) — NOT outerHTML+parse —
+    //    because HTML5 parsing collapses nested <body> elements (which
+    //    Shepherd's shadow root has at the top level), which would scramble
+    //    child indices and break path-replay.
+    //
+    // Returns either the matched node, or a small object describing why
+    // nothing matched (`__cdp_resolve__: 'direct'|'clone'|'none'`) so the
+    // caller can log which strategy each root tried.
+    const fnDecl = `function (xp) {
+      var ctx = this;
+      var isDoc = ctx.nodeType === 9;
+      var isFrag = ctx.nodeType === 11;
+
+      function relativize(q) { return q.charAt(0) === '/' ? '.' + q : q; }
+
+      // (a) direct document.evaluate — main doc + open shadow roots
+      try {
+        var doc = isDoc ? ctx : (ctx.ownerDocument || document);
+        var queries = isDoc ? [xp] : [relativize(xp), xp];
+        for (var i = 0; i < queries.length; i++) {
+          try {
+            var r = doc.evaluate(queries[i], ctx, null, 9, null);
+            if (r && r.singleNodeValue) return r.singleNodeValue;
+          } catch (e) {}
+        }
+      } catch (e) {}
+
+      // (b) clone-into-light-DOM fallback for closed shadow roots
+      if (isFrag && ctx.children && ctx.children.length > 0) {
+        var mainDoc = ctx.ownerDocument || document;
+        var holder = null;
+        try {
+          holder = mainDoc.createElement('div');
+          holder.style.cssText =
+            'position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;overflow:hidden;visibility:hidden;';
+          // Must be attached to a document tree for evaluate to see it.
+          mainDoc.body.appendChild(holder);
+          for (var c = 0; c < ctx.children.length; c++) {
+            holder.appendChild(ctx.children[c].cloneNode(true));
+          }
+          var sq = relativize(xp);
+          var sr = mainDoc.evaluate(sq, holder, null, 9, null);
+          if (sr && sr.singleNodeValue) {
+            // Walk up from cloned match to one of holder.children,
+            // recording child-indices. Replay onto the live shadow root.
+            var path = [];
+            var n = sr.singleNodeValue;
+            while (n && n.parentElement && n.parentElement !== holder) {
+              var sibs = n.parentElement.children;
+              for (var k = 0; k < sibs.length; k++) {
+                if (sibs[k] === n) { path.unshift(k); break; }
+              }
+              n = n.parentElement;
+            }
+            if (n && n.parentElement === holder) {
+              var topIdx = -1;
+              for (var m = 0; m < holder.children.length; m++) {
+                if (holder.children[m] === n) { topIdx = m; break; }
+              }
+              if (topIdx >= 0) {
+                path.unshift(topIdx);
+                var live = ctx;
+                for (var p = 0; p < path.length; p++) {
+                  var idx = path[p];
+                  if (!live.children || idx >= live.children.length) {
+                    live = null; break;
+                  }
+                  live = live.children[idx];
+                }
+                if (live) return live;
+              }
+            }
+            // Clone matched but path-replay failed — return a sentinel so
+            // the caller can log it.
+            return { __cdp_resolve__: 'clone-replay-failed' };
+          }
+          // Clone tried, no match.
+          return { __cdp_resolve__: 'clone-no-match' };
+        } catch (e) {
+          return { __cdp_resolve__: 'clone-threw', err: String(e) };
+        } finally {
+          if (holder && holder.parentNode) holder.parentNode.removeChild(holder);
+        }
+      }
+
+      return null;
+    }`;
+
+    let walked = 0;
+    let errored = 0;
+    const synthOutcomes: string[] = [];
+    for (const rootNodeId of rootIds) {
+      walked++;
+      let rootObjectId: string | undefined;
+      let matchObjectId: string | undefined;
+      try {
+        const resolved = await send('DOM.resolveNode', { nodeId: rootNodeId });
+        rootObjectId = resolved?.object?.objectId;
+        if (!rootObjectId) continue;
+
+        const res = await send('Runtime.callFunctionOn', {
+          objectId: rootObjectId,
+          functionDeclaration: fnDecl,
+          arguments: [{ value: xpath }],
+          returnByValue: false,
+        });
+        if (res?.exceptionDetails) {
+          errored++;
+          continue;
+        }
+        const obj = res?.result;
+        if (!obj) continue;
+        // Null comes back as { type: 'object', subtype: 'null', value: null }.
+        if (obj.subtype === 'null' || obj.type === 'undefined') continue;
+        matchObjectId = obj.objectId;
+        if (!matchObjectId) continue;
+
+        // The function returns either an Element (subtype 'node') or, for
+        // closed-shadow clone attempts, a diagnostic sentinel object. Read
+        // the sentinel before falling through to DOM.requestNode.
+        if (obj.subtype !== 'node') {
+          try {
+            const sentinel = await send('Runtime.callFunctionOn', {
+              objectId: matchObjectId,
+              functionDeclaration: 'function () { return this.__cdp_resolve__; }',
+              returnByValue: true,
+            });
+            const tag = sentinel?.result?.value;
+            if (typeof tag === 'string') synthOutcomes.push(tag);
+          } catch {
+            /* ignore diagnostic failure */
+          }
+          continue;
+        }
+
+        const requested = await send('DOM.requestNode', { objectId: matchObjectId });
+        const matchNodeId: number | undefined = requested?.nodeId;
+        if (matchNodeId) {
+          this.log('info', `CDP DOM walk: matched after ${walked}/${rootIds.length} roots.`);
+          return matchNodeId;
+        }
+      } catch {
+        errored++;
+      } finally {
+        if (matchObjectId) {
+          await send('Runtime.releaseObject', { objectId: matchObjectId }).catch(() => {});
+        }
+        if (rootObjectId) {
+          await send('Runtime.releaseObject', { objectId: rootObjectId }).catch(() => {});
+        }
+      }
     }
+
+    const synthSummary =
+      synthOutcomes.length > 0 ? `; synth: ${synthOutcomes.join(', ')}` : '';
+    this.log(
+      'info',
+      `CDP DOM walk: no match across ${rootIds.length} roots (${errored} errored)${synthSummary}.`,
+    );
+    return null;
   }
 
   /**
@@ -605,6 +882,56 @@ export class Page {
 }
 
 /** True if a child target's type can run DOM/Runtime evaluation. */
+/**
+ * Walks a CDP DOM tree (from DOM.getDocument({pierce:true})) looking for any
+ * shadow root with `shadowRootType === 'closed'`. Short-circuits on first hit.
+ * Recurses into children, shadowRoots, and contentDocument so it catches
+ * closed shadow inside same-origin iframes too.
+ */
+function anyClosedShadow(node: any): boolean {
+  if (!node || typeof node !== 'object') return false;
+  if (Array.isArray(node.shadowRoots)) {
+    for (const sr of node.shadowRoots) {
+      if (sr?.shadowRootType === 'closed') return true;
+      if (anyClosedShadow(sr)) return true;
+    }
+  }
+  if (Array.isArray(node.children)) {
+    for (const c of node.children) {
+      if (anyClosedShadow(c)) return true;
+    }
+  }
+  if (node.contentDocument && anyClosedShadow(node.contentDocument)) return true;
+  return false;
+}
+
 function isDomTarget(type: string | undefined): boolean {
   return type === 'iframe' || type === 'page';
+}
+
+/**
+ * Walks a pierced CDP DOM tree and collects every nodeId we can scope an XPath
+ * to: the main Document, each ShadowRoot (open or closed), and every
+ * same-origin iframe's contentDocument. Order matters — main document first,
+ * then shadow roots in tree order, then iframe docs — so that a hit in the
+ * light DOM beats a hit in a shadow.
+ *
+ * Shadow roots come through CDP as `shadowRoots: [...]` on their host element,
+ * with `nodeType === 11` (DocumentFragment). Documents have `nodeType === 9`.
+ */
+function collectRootNodeIds(node: any, out: number[]): void {
+  if (!node || typeof node !== 'object') return;
+  if (node.nodeType === 9 && typeof node.nodeId === 'number') {
+    out.push(node.nodeId);
+  }
+  if (Array.isArray(node.shadowRoots)) {
+    for (const sr of node.shadowRoots) {
+      if (sr && typeof sr.nodeId === 'number') out.push(sr.nodeId);
+      collectRootNodeIds(sr, out);
+    }
+  }
+  if (Array.isArray(node.children)) {
+    for (const c of node.children) collectRootNodeIds(c, out);
+  }
+  if (node.contentDocument) collectRootNodeIds(node.contentDocument, out);
 }
