@@ -544,6 +544,92 @@ export class Page {
     return serializeEvalResult(res?.result?.value);
   }
 
+  /**
+   * Inject files into a real `<input type="file">` via `DOM.setFileInputFiles`.
+   * This is the only reliable way to attach files in an automation — there's
+   * no page-JS equivalent.
+   *
+   * Polls `cdpResolveXPath` until the input appears or `timeoutMs` elapses
+   * (default 20s). Verifies the resolved node is actually an `INPUT[type=file]`
+   * — if the user pointed at a styled wrapper, we fail fast with a clear
+   * "target is not an <input type='file'>" instead of CDP's opaque error.
+   * File paths are required to be absolute; relatives get rejected up-front.
+   */
+  async upload(
+    locator: Locator,
+    files: string[],
+    opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
+  ): Promise<void> {
+    await this.validateXPath(locator.xpath);
+    // pierceClosed accepted for parity; cdpResolveXPath always pierces.
+    void opts.pierceClosed;
+
+    for (const f of files) {
+      if (!isAbsoluteFilePath(f)) {
+        throw new Error(
+          `upload: file path must be absolute — got '${f}'. ` +
+            'Chrome resolves relative paths against an unpredictable cwd, so we require an absolute path on the local filesystem.',
+        );
+      }
+    }
+
+    const send = (m: string, p?: Record<string, unknown>) =>
+      this.sendCmd(this.tabTarget, m, p);
+
+    // Poll for the input to appear. Mirrors the cdpFindAndActPolling cadence
+    // (500ms) but skips the FrameResult plumbing — upload doesn't run an
+    // in-page action function, just resolves a nodeId and feeds it to
+    // setFileInputFiles directly.
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+    let nodeId: number | null = null;
+    while (true) {
+      nodeId = await this.cdpResolveXPath(send, locator.xpath);
+      if (nodeId) break;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `upload: locator not found within ${Math.round(timeoutMs / 1000)}s — '${locator.xpath}'`,
+        );
+      }
+      await sleep(500);
+    }
+
+    // Verify it's actually a file input. setFileInputFiles silently fails on
+    // a wrong target (Chrome accepts the call but no files attach); we'd
+    // rather surface the mistake here than have the user wonder why the
+    // upload "succeeded" but nothing happened.
+    const resolved = await send('DOM.resolveNode', { nodeId });
+    const objectId = resolved?.object?.objectId;
+    if (objectId) {
+      try {
+        const check = await send('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration:
+            'function () { return { tag: this.tagName, type: (this.type || "").toLowerCase() }; }',
+          returnByValue: true,
+        });
+        const meta = check?.result?.value as { tag?: string; type?: string } | undefined;
+        if (meta?.tag !== 'INPUT' || meta?.type !== 'file') {
+          const got = meta?.tag
+            ? `<${meta.tag.toLowerCase()}${meta.type ? ` type="${meta.type}"` : ''}>`
+            : 'unknown';
+          throw new Error(
+            `upload: target is not an <input type="file"> (got ${got}). ` +
+              "Many sites hide the real input behind a styled wrapper button — point the xpath at the input itself, not the wrapper.",
+          );
+        }
+      } finally {
+        await send('Runtime.releaseObject', { objectId }).catch(() => {});
+      }
+    }
+
+    await send('DOM.setFileInputFiles', { nodeId, files });
+    this.log(
+      'success',
+      `Uploaded ${files.length} file${files.length === 1 ? '' : 's'} into '${locator.xpath}'.`,
+    );
+  }
+
   private async runAction(
     locator: Locator,
     mode: Mode,
@@ -1137,6 +1223,21 @@ function anyClosedShadow(node: any): boolean {
 
 function isDomTarget(type: string | undefined): boolean {
   return type === 'iframe' || type === 'page';
+}
+
+/**
+ * Cross-platform absolute-path heuristic for `DOM.setFileInputFiles`.
+ *   - Unix / macOS: starts with `/`
+ *   - Windows drive: `C:\…` or `C:/…`
+ *   - Windows UNC:   `\\server\share\…`
+ * Anything else we treat as relative and reject up-front.
+ */
+function isAbsoluteFilePath(p: string): boolean {
+  if (!p) return false;
+  if (p.startsWith('/')) return true;
+  if (/^[A-Za-z]:[\\/]/.test(p)) return true;
+  if (p.startsWith('\\\\')) return true;
+  return false;
 }
 
 /**

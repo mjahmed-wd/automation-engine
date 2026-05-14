@@ -15,6 +15,7 @@ import { waitAction } from './wait';
 import { waitForAction } from './waitFor';
 import { pressAction } from './press';
 import { evaluateAction } from './evaluate';
+import { uploadAction } from './upload';
 
 export type ActionHandler = (
   step: any,
@@ -31,6 +32,7 @@ export const actions: Record<AutomationStep['action'], ActionHandler> = {
   waitFor: waitForAction,
   press: pressAction,
   evaluate: evaluateAction,
+  upload: uploadAction,
 };
 
 export function resolveAction(name: string): ActionHandler | undefined {
