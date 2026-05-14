@@ -93,6 +93,14 @@ export class Page {
    * `pierceClosed: true` (force CDP) or `pierceClosed: false` (force fast path).
    */
   private hasClosedShadow = false;
+  /**
+   * One-shot response for the next native dialog (`alert` / `confirm` /
+   * `prompt`). Set by `setNextDialogResponse`, consumed by `onEvent` when
+   * `Page.javascriptDialogOpening` arrives. `null` means "use default
+   * auto-accept with empty prompt" — that default prevents scripts from
+   * hanging on a stray `confirm("Are you sure?")` they didn't expect.
+   */
+  private nextDialogResponse: { accept: boolean; promptText: string } | null = null;
   private nextMsgId = 1;
   private listener?: (
     source: chrome.debugger.Debuggee,
@@ -125,6 +133,10 @@ export class Page {
 
     await this.sendCmd(this.tabTarget, 'Runtime.enable');
     await this.sendCmd(this.tabTarget, 'DOM.enable').catch(() => {});
+    // Required to receive Page.javascriptDialogOpening events. Without
+    // Page.enable, native alert()/confirm()/prompt() would block the page
+    // indefinitely and stall the run loop.
+    await this.sendCmd(this.tabTarget, 'Page.enable').catch(() => {});
     await this.sendCmd(this.tabTarget, 'Target.setAutoAttach', {
       autoAttach: true,
       waitForDebuggerOnStart: false,
@@ -173,6 +185,31 @@ export class Page {
     } else if (method === 'Target.detachedFromTarget') {
       this.childSessions.delete(params.sessionId);
       this.cdpReadyChildren.delete(params.sessionId);
+    } else if (method === 'Page.javascriptDialogOpening') {
+      // The JS thread is blocked until we respond. Resolve the one-shot
+      // response if armed, else auto-accept so the script doesn't hang.
+      // Fire-and-forget the dismissal — we can't await inside an event
+      // listener, and any handleJavaScriptDialog failure is logged out-of-band.
+      const armed = this.nextDialogResponse;
+      this.nextDialogResponse = null;
+      const response = armed ?? { accept: true, promptText: '' };
+      const dialogType: string = params?.type ?? 'dialog';
+      const messageQuoted = params?.message ? `"${String(params.message)}"` : '';
+      const choice = response.accept
+        ? response.promptText
+          ? `accept with "${response.promptText}"`
+          : 'accept'
+        : 'cancel';
+      this.log(
+        'info',
+        `Dialog ${dialogType}(${messageQuoted}) → ${choice}${armed ? '' : ' (default)'}`,
+      );
+      this.sendCmd(this.tabTarget, 'Page.handleJavaScriptDialog', {
+        accept: response.accept,
+        promptText: response.promptText,
+      }).catch((err: any) =>
+        this.log('error', `handleJavaScriptDialog failed: ${err?.message ?? err}`),
+      );
     } else if (method === 'Target.receivedMessageFromTarget') {
       let msg: any;
       try {
@@ -207,6 +244,20 @@ export class Page {
       }),
     );
     this.log('info', 'Debugger detached.');
+  }
+
+  /**
+   * Pre-arm the one-shot response for the next native dialog. Called by the
+   * `dialog` action handler. Single audit point so the field stays private.
+   * If never consumed, the arming sits until the next dialog fires — pair
+   * this immediately before the step that will actually trigger one.
+   */
+  setNextDialogResponse(accept: boolean, promptText: string = ''): void {
+    this.nextDialogResponse = { accept, promptText };
+    this.log(
+      'info',
+      `Next dialog armed → ${accept ? (promptText ? `accept with "${promptText}"` : 'accept') : 'cancel'}`,
+    );
   }
 
   // ---------- high-level actions ----------
