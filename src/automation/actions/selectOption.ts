@@ -1,6 +1,7 @@
 import type { ExecutionContext, SelectOptionStep } from '../schema';
 import { resolveLocator, substituteRaw } from '../schema';
 import type { Page } from '../page';
+import { withLocatorContext } from '../errors';
 
 /**
  * Pick option(s) in a native `<select>`. Match by exactly one of `value` or
@@ -33,9 +34,18 @@ export async function selectOptionAction(
   }
   const resolved = wants.map((w) => substituteRaw(String(w), ctx));
   const locator = resolveLocator(step, ctx);
-  await page.selectOption(locator, resolved, {
-    useLabel: hasLabel,
-    pierceClosed: step.pierceClosed,
-    timeoutMs: step.timeoutMs,
-  });
+  await withLocatorContext(
+    {
+      action: step.action,
+      original: step.xpath,
+      resolved: locator.xpath,
+      value: resolved.length === 1 ? resolved[0] : resolved.join(', '),
+    },
+    () =>
+      page.selectOption(locator, resolved, {
+        useLabel: hasLabel,
+        pierceClosed: step.pierceClosed,
+        timeoutMs: step.timeoutMs,
+      }),
+  );
 }

@@ -1,6 +1,7 @@
 import type { ExecutionContext, UploadStep } from '../schema';
 import { resolveLocator, substituteRaw } from '../schema';
 import type { Page } from '../page';
+import { withLocatorContext } from '../errors';
 
 /**
  * Attach files to an `<input type="file">` via CDP. Files must be absolute
@@ -29,8 +30,17 @@ export async function uploadAction(step: UploadStep, ctx: ExecutionContext, page
   }
   const files = raw.map((f) => substituteRaw(String(f), ctx));
   const locator = resolveLocator(step, ctx);
-  await page.upload(locator, files, {
-    pierceClosed: step.pierceClosed,
-    timeoutMs: step.timeoutMs,
-  });
+  await withLocatorContext(
+    {
+      action: step.action,
+      original: step.xpath,
+      resolved: locator.xpath,
+      value: files.length === 1 ? files[0] : `${files.length} files`,
+    },
+    () =>
+      page.upload(locator, files, {
+        pierceClosed: step.pierceClosed,
+        timeoutMs: step.timeoutMs,
+      }),
+  );
 }

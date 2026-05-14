@@ -1012,6 +1012,15 @@ export class Page {
     // Surface XPath syntax errors loudly before the 20-second search timeout.
     await this.validateXPath(locator.xpath);
 
+    // Single shared deadline across fast path + CDP fallback. Previously each
+    // phase got its own `timeoutMs`, so `timeoutMs: 2000` effectively allowed
+    // 4s total when the fast path missed and CDP also polled. Now `timeoutMs`
+    // is the wall-clock budget for the whole action — the fast path gets the
+    // full budget, the fallback gets whatever's left (typically a single
+    // CDP attempt before bailing).
+    const totalTimeout = timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+    const deadline = Date.now() + totalTimeout;
+
     // Three-state pierceClosed:
     //   true       → always CDP (overrides auto-detection)
     //   false      → always fast path (overrides auto-detection)
@@ -1027,32 +1036,30 @@ export class Page {
           ? 'pierceClosed=true — going straight to CDP DOM walk.'
           : 'Closed shadow detected — going straight to CDP DOM walk.',
       );
-      return await this.cdpFindAndActPolling(
-        locator,
-        mode,
-        opts,
-        timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS,
-      );
+      return await this.cdpFindAndActPolling(locator, mode, opts, totalTimeout);
     }
 
     const expression = buildActionExpression(locator, mode, opts);
     let fastErr: Error | null = null;
     try {
-      return await this.runUntilFound(expression, timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS);
+      return await this.runUntilFound(expression, totalTimeout);
     } catch (err) {
       // Found-but-rejected — CDP won't change the verdict. Re-throw now.
       if (err instanceof FatalActionError) throw err;
       fastErr = err as Error;
     }
 
-    this.log('info', 'Fast path missed — trying CDP DOM walk for closed shadow roots…');
+    // Remaining budget for the CDP fallback. If the fast path consumed
+    // everything, the polling loop still does ONE attempt before checking
+    // the deadline — that's the right behavior for "give CDP a single shot
+    // at closed-shadow content the fast path can't see."
+    const remainingMs = Math.max(0, deadline - Date.now());
+    this.log(
+      'info',
+      `Fast path missed — trying CDP DOM walk for closed shadow roots (${remainingMs}ms remaining)…`,
+    );
     try {
-      return await this.cdpFindAndActPolling(
-        locator,
-        mode,
-        opts,
-        timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS,
-      );
+      return await this.cdpFindAndActPolling(locator, mode, opts, remainingMs);
     } catch (cdpErr: any) {
       if (cdpErr instanceof FatalActionError) throw cdpErr;
       this.log('info', `CDP fallback also failed: ${cdpErr?.message ?? cdpErr}`);
