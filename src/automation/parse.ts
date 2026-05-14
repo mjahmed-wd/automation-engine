@@ -79,7 +79,8 @@ const isString = (v: unknown): v is string => typeof v === 'string';
 const isNumber = (v: unknown): v is number => typeof v === 'number' && !Number.isNaN(v);
 const isBoolean = (v: unknown): v is boolean => typeof v === 'boolean';
 
-const stepValidators: Record<string, StepValidator> = {
+/** Exported so unit tests can pin the keyset against actions/index.ts. */
+export const stepValidators: Record<string, StepValidator> = {
   goto: (s, n) => {
     if (!isString(s.url)) return `Step ${n}: goto requires "url" (string).`;
     if (s.waitForXPath !== undefined && !isString(s.waitForXPath))

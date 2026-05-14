@@ -311,8 +311,10 @@ export interface ExecutionContext {
 // Substitution
 // -------------------------------------------------------------------------
 
-/** Encode a runtime string as an XPath string literal. */
-function xpathStringLiteral(value: string): string {
+/** Encode a runtime string as an XPath string literal.
+ *  Exported for unit testing — the `concat()` branch is fiddly and worth
+ *  pinning with a test. */
+export function xpathStringLiteral(value: string): string {
   if (!value.includes("'")) return `'${value}'`;
   if (!value.includes('"')) return `"${value}"`;
   const parts = value.split("'");
