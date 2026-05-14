@@ -18,7 +18,7 @@
 
 import type { Locator } from './schema';
 
-export type Mode = 'find' | 'fill' | 'click' | 'get';
+export type Mode = 'find' | 'fill' | 'click' | 'get' | 'hover';
 
 export interface GetOptions {
   attribute?: string;
@@ -200,6 +200,47 @@ export function buildCallFunctionExpression(
       __dispatch(MouseEvent, 'mouseup', __opts);
       __dispatch(MouseEvent, 'click', __opts);
     `;
+  } else if (mode === 'hover') {
+    // Mirror of the fast-path hover block in buildActionExpression. Currently
+    // dead in page.hover() (which routes closed-shadow to cdpTrustedHover
+    // rather than cdpFindAndAct), but kept in lockstep so the two paths
+    // don't drift.
+    actionBlock = `
+      this.scrollIntoView({ block: 'center', inline: 'center' });
+      const __r = this.getBoundingClientRect();
+      const __cx = __r.left + __r.width / 2;
+      const __cy = __r.top + __r.height / 2;
+      try {
+        const __root = this.getRootNode();
+        const __efp = (__root && typeof __root.elementsFromPoint === 'function'
+          ? __root.elementsFromPoint(__cx, __cy)
+          : document.elementsFromPoint(__cx, __cy));
+        const __top = __efp && __efp[0];
+        if (__top && !this.contains(__top)) {
+          var __tag = this.tagName ? this.tagName.toLowerCase() : 'element';
+          var __ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
+          var __topTag = __top.tagName ? __top.tagName.toLowerCase() : 'element';
+          return {
+            ok: false,
+            fatal: true,
+            reason: 'covered',
+            message: 'Cannot hover ' + __tag + __ident + ': covered by <' + __topTag + '>',
+            frame: location.href,
+            tag: this.tagName,
+            name: this.name || this.id || '',
+          };
+        }
+      } catch (e) {}
+      const __opts = { bubbles: true, cancelable: true, composed: true, view: window, clientX: __cx, clientY: __cy };
+      const __popts = Object.assign({}, __opts, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
+      const __dispatch = (Ctor, type, init) => { try { this.dispatchEvent(new Ctor(type, init)); } catch (e) {} };
+      __dispatch(PointerEvent, 'pointerover', __popts);
+      __dispatch(PointerEvent, 'pointerenter', __popts);
+      __dispatch(MouseEvent, 'mouseover', __opts);
+      __dispatch(MouseEvent, 'mouseenter', __opts);
+      __dispatch(PointerEvent, 'pointermove', __popts);
+      __dispatch(MouseEvent, 'mousemove', __opts);
+    `;
   }
 
   let valueExpr: string;
@@ -362,7 +403,7 @@ export function buildActionExpression(
 ): string {
   // Reads should not be gated by visibility — page <title>, meta, hidden
   // inputs etc. are all legitimate read targets.
-  const requireVisible = mode === 'fill' || mode === 'click';
+  const requireVisible = mode === 'fill' || mode === 'click' || mode === 'hover';
   const finder = buildFinderExpression(locator, requireVisible);
 
   let actionBlock = '';
@@ -463,6 +504,48 @@ export function buildActionExpression(
       __dispatch(PointerEvent, 'pointerup', __popts);
       __dispatch(MouseEvent, 'mouseup', __opts);
       __dispatch(MouseEvent, 'click', __opts);
+    `;
+  } else if (mode === 'hover') {
+    // Synthetic hover dispatch. JS hover handlers (mouseenter / pointerover
+    // listeners) fire normally; CSS `:hover` does NOT — only a real cursor
+    // move via Input.dispatchMouseEvent triggers it, which page.hover()'s
+    // trusted path handles. This block is the iframe / synthetic-only fallback.
+    actionBlock = `
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const __r = el.getBoundingClientRect();
+      const __cx = __r.left + __r.width / 2;
+      const __cy = __r.top + __r.height / 2;
+      // Overlay hit-test — same rationale as click.
+      try {
+        const __root = el.getRootNode();
+        const __efp = (__root && typeof __root.elementsFromPoint === 'function'
+          ? __root.elementsFromPoint(__cx, __cy)
+          : document.elementsFromPoint(__cx, __cy));
+        const __top = __efp && __efp[0];
+        if (__top && !el.contains(__top)) {
+          var __tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+          var __ident = el.name ? '[name="' + el.name + '"]' : (el.id ? '#' + el.id : '');
+          var __topTag = __top.tagName ? __top.tagName.toLowerCase() : 'element';
+          return {
+            ok: false,
+            fatal: true,
+            reason: 'covered',
+            message: 'Cannot hover ' + __tag + __ident + ': covered by <' + __topTag + '>',
+            frame: location.href,
+            tag: el.tagName,
+            name: el.name || el.id || '',
+          };
+        }
+      } catch (e) {}
+      const __opts = { bubbles: true, cancelable: true, composed: true, view: window, clientX: __cx, clientY: __cy };
+      const __popts = Object.assign({}, __opts, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
+      const __dispatch = (Ctor, type, init) => { try { el.dispatchEvent(new Ctor(type, init)); } catch (e) {} };
+      __dispatch(PointerEvent, 'pointerover', __popts);
+      __dispatch(PointerEvent, 'pointerenter', __popts);
+      __dispatch(MouseEvent, 'mouseover', __opts);
+      __dispatch(MouseEvent, 'mouseenter', __opts);
+      __dispatch(PointerEvent, 'pointermove', __popts);
+      __dispatch(MouseEvent, 'mousemove', __opts);
     `;
   }
 

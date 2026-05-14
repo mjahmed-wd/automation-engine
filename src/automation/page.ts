@@ -441,6 +441,174 @@ export class Page {
     });
   }
 
+  /**
+   * Hover the cursor over an element. Parallels page.click() but only emits
+   * the cursor move — no press/release/click. Trusted path (CDP
+   * Input.dispatchMouseEvent({type:'mouseMoved'})) is preferred because it's
+   * the only thing that triggers CSS `:hover`; synthetic dispatch via
+   * buildActionExpression('hover') is the iframe fallback (fires JS hover
+   * handlers only).
+   */
+  async hover(
+    locator: Locator,
+    opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
+  ): Promise<FrameResult> {
+    await this.validateXPath(locator.xpath);
+    const timeout = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+
+    // Three-state pierceClosed: same gate as click. Closed-shadow auto-detect
+    // flips us straight to CDP-trusted hover.
+    const shouldUseCdp =
+      opts.pierceClosed === true ||
+      (opts.pierceClosed !== false && this.hasClosedShadow);
+
+    if (shouldUseCdp) {
+      this.log(
+        'info',
+        opts.pierceClosed === true
+          ? 'pierceClosed=true — CDP-resolving and trusted-hover.'
+          : 'Closed shadow detected — CDP-resolving and trusted-hover.',
+      );
+      return await this.cdpTrustedHover(locator);
+    }
+
+    const resolveExpr = buildResolveExpression(locator);
+    let resolved: any;
+    let result: FrameResult;
+    try {
+      resolved = await this.runUntilFound(resolveExpr, timeout);
+    } catch (fastErr) {
+      if (fastErr instanceof FatalActionError) throw fastErr;
+      this.log('info', 'Fast-path resolve missed — trying CDP DOM walk.');
+      try {
+        result = await this.cdpTrustedHover(locator);
+      } catch (cdpErr) {
+        if (cdpErr instanceof FatalActionError) throw cdpErr;
+        throw fastErr;
+      }
+      this.detectClosedShadow().catch(() => {});
+      return result;
+    }
+
+    if (resolved?.isMain === true && typeof resolved.x === 'number') {
+      await this.dispatchTrustedMouseMove(resolved.x, resolved.y);
+      this.log(
+        'success',
+        `Hovered ${resolved.tag ?? 'element'} (trusted) at (${Math.round(
+          resolved.x,
+        )}, ${Math.round(resolved.y)}) in ${resolved.frame}`,
+      );
+      result = { ok: true, frame: resolved.frame, tag: resolved.tag, name: resolved.name };
+    } else {
+      // Iframe element — synthetic event dispatch (JS hover handlers only;
+      // CSS :hover won't fire from synthetic events).
+      this.log(
+        'info',
+        `Hover target in iframe ${resolved?.frame ?? ''} — using synthetic event dispatch.`,
+      );
+      result = await this.runUntilFound(
+        buildActionExpression(locator, 'hover'),
+        timeout,
+      );
+    }
+
+    // Hover often reveals new DOM (tooltips, dropdowns) including newly
+    // mounted closed shadow. Fire-and-forget re-detect so the next action
+    // routes correctly.
+    if (!this.hasClosedShadow) {
+      this.detectClosedShadow().catch(() => {});
+    }
+    return result;
+  }
+
+  /**
+   * Resolve via CDP (handles closed shadow), scroll-into-view + overlay
+   * hit-test in one round trip, then trusted mouseMoved at the element's
+   * center. Used both for the auto-detected-closed-shadow gate and the
+   * fast-path-miss fallback.
+   */
+  private async cdpTrustedHover(locator: Locator): Promise<FrameResult> {
+    const send = (m: string, p?: Record<string, unknown>) =>
+      this.sendCmd(this.tabTarget, m, p);
+    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
+    if (!nodeId) {
+      throw new Error(`No match found for '${locator.xpath}' via CDP DOM walk.`);
+    }
+
+    // scrollIntoView + overlay hit-test in a single callFunctionOn (same
+    // pattern as cdpTrustedClick).
+    const resolved = await send('DOM.resolveNode', { nodeId });
+    const objectId = resolved?.object?.objectId;
+    if (objectId) {
+      try {
+        const checkRes = await send('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: `function () {
+            this.scrollIntoView({ block: 'center', inline: 'center' });
+            const r = this.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            try {
+              const root = this.getRootNode();
+              const efp = (root && typeof root.elementsFromPoint === 'function'
+                ? root.elementsFromPoint(cx, cy)
+                : document.elementsFromPoint(cx, cy));
+              const top = efp && efp[0];
+              if (top && !this.contains(top)) {
+                const tag = this.tagName ? this.tagName.toLowerCase() : 'element';
+                const ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
+                const topTag = top.tagName ? top.tagName.toLowerCase() : 'element';
+                return {
+                  ok: false,
+                  fatal: true,
+                  reason: 'covered',
+                  message: 'Cannot hover ' + tag + ident + ': covered by <' + topTag + '>',
+                  frame: location.href,
+                  tag: this.tagName,
+                  name: this.name || this.id || '',
+                };
+              }
+            } catch (e) {}
+            return { ok: true };
+          }`,
+          returnByValue: true,
+        });
+        const out = checkRes?.result?.value as FrameResult | undefined;
+        if (out?.fatal) {
+          throw new FatalActionError(
+            out.message ?? `Hover target is ${out.reason ?? 'rejected'}`,
+          );
+        }
+      } finally {
+        await send('Runtime.releaseObject', { objectId }).catch(() => {});
+      }
+    }
+
+    const box = await send('DOM.getBoxModel', { nodeId });
+    const content = box?.model?.content as number[] | undefined;
+    if (!content || content.length < 8) {
+      throw new Error('Element has no box model (zero-size or detached).');
+    }
+    const x = (content[0] + content[4]) / 2;
+    const y = (content[1] + content[5]) / 2;
+    await this.dispatchTrustedMouseMove(x, y);
+    this.log(
+      'success',
+      `Hovered (trusted, CDP-resolved) at (${Math.round(x)}, ${Math.round(y)}).`,
+    );
+    return { ok: true, frame: '' };
+  }
+
+  /** Trusted cursor-move via CDP. Triggers CSS `:hover` natively, plus all
+   *  the pointer/mouse hover events Chrome would normally dispatch. */
+  private async dispatchTrustedMouseMove(x: number, y: number): Promise<void> {
+    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x,
+      y,
+    });
+  }
+
   async waitFor(
     locator: Locator,
     opts: { timeoutMs?: number; pierceClosed?: boolean } = {},

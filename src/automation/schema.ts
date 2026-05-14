@@ -98,6 +98,30 @@ export interface PressStep extends BaseStep {
 }
 
 /**
+ * Hover over an element. Used as a precondition for "hover-reveals-button →
+ * click button" flows (Bootstrap dropdowns, table-row action menus, tooltip
+ * triggers).
+ *
+ * Two paths internally:
+ *   - **Trusted** (main frame OR closed-shadow CDP): one
+ *     `Input.dispatchMouseEvent({type:'mouseMoved'})`. CSS `:hover` fires
+ *     natively, plus all the pointer/mouse events. **Preferred.**
+ *   - **Synthetic** (iframe-resolved targets where viewport coords don't
+ *     map cleanly): in-page dispatch of `pointerover/pointerenter/mouseover/
+ *     mouseenter/pointermove/mousemove`. JS hover handlers fire; CSS
+ *     `:hover` does NOT.
+ *
+ *   { "action": "hover", "xpath": "//div[@class='row']" }
+ */
+export interface HoverStep extends BaseStep {
+  action: 'hover';
+  xpath: string;
+  pierceClosed?: boolean;
+  /** How long the search loop polls before failing. Default 20s. */
+  timeoutMs?: number;
+}
+
+/**
  * Programmatically pick option(s) in a native `<select>`. Setting
  * `select.value` (single) or `option.selected` (multi) is much more reliable
  * than clicking — native select dropdowns render as an OS-level popup that
@@ -188,7 +212,8 @@ export type AutomationStep =
   | PressStep
   | EvaluateStep
   | UploadStep
-  | SelectOptionStep;
+  | SelectOptionStep
+  | HoverStep;
 
 /** Tag identifies which sidepanel tab a script's example belongs in. */
 export type AutomationTag = 'action' | 'get';

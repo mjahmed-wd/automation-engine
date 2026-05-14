@@ -17,6 +17,7 @@ import { pressAction } from './press';
 import { evaluateAction } from './evaluate';
 import { uploadAction } from './upload';
 import { selectOptionAction } from './selectOption';
+import { hoverAction } from './hover';
 
 export type ActionHandler = (
   step: any,
@@ -35,6 +36,7 @@ export const actions: Record<AutomationStep['action'], ActionHandler> = {
   evaluate: evaluateAction,
   upload: uploadAction,
   selectOption: selectOptionAction,
+  hover: hoverAction,
 };
 
 export function resolveAction(name: string): ActionHandler | undefined {
