@@ -30,6 +30,7 @@ import type { Locator, LogFn } from './schema';
 import {
   buildActionExpression,
   buildCallFunctionExpression,
+  buildDescribeExpression,
   buildResolveExpression,
   type GetOptions,
   type Mode,
@@ -59,6 +60,24 @@ export interface FrameResult {
   reason?: string;
   /** Human-readable error built in-page so the loop can throw it verbatim. */
   message?: string;
+}
+
+/** One element's worth of metadata returned by `describe`. */
+export interface DescribeMatch {
+  frame: string;
+  tag: string;
+  id?: string;
+  name?: string;
+  classes: string[];
+  /** First 60 chars of `innerText`, trimmed. Ellipsis appended if truncated. */
+  text: string;
+}
+
+/** Result shape of `page.describe`. `matches` is capped at 5; `matchCount`
+ *  is exact (i.e., may exceed `matches.length`). */
+export interface DescribeResult {
+  matchCount: number;
+  matches: DescribeMatch[];
 }
 
 /**
@@ -675,6 +694,98 @@ export class Page {
       x,
       y,
     });
+  }
+
+  /**
+   * Side-effect-free diagnostic — enumerate the matches for an xpath and
+   * return their metadata. Routes through the same `shouldUseCdp` gate as
+   * other actions; the fast path enumerates fully (up to 5 matches), the
+   * CDP path returns at most one match because `cdpResolveXPath` short-
+   * circuits on first.
+   *
+   * No polling — `describe` reports the current state. Pair with a `waitFor`
+   * beforehand if the element is async-mounted.
+   */
+  async describe(
+    locator: Locator,
+    opts: { pierceClosed?: boolean } = {},
+  ): Promise<DescribeResult> {
+    await this.validateXPath(locator.xpath);
+
+    const shouldUseCdp =
+      opts.pierceClosed === true ||
+      (opts.pierceClosed !== false && this.hasClosedShadow);
+
+    if (shouldUseCdp) {
+      this.log(
+        'info',
+        opts.pierceClosed === true
+          ? 'pierceClosed=true — describe via CDP DOM walk (first match only).'
+          : 'Closed shadow detected — describe via CDP DOM walk (first match only).',
+      );
+      return await this.describeCdp(locator);
+    }
+
+    const res = await this.sendCmd<any>(this.tabTarget, 'Runtime.evaluate', {
+      expression: buildDescribeExpression(locator),
+      returnByValue: true,
+      awaitPromise: false,
+    });
+    if (res?.exceptionDetails) {
+      const desc =
+        res.exceptionDetails.exception?.description ??
+        res.exceptionDetails.text ??
+        'describe failed';
+      throw new Error(`describe: ${desc}`);
+    }
+    const value = res?.result?.value as DescribeResult | undefined;
+    return value ?? { matchCount: 0, matches: [] };
+  }
+
+  /** CDP path for `describe`. Returns at most one match — extending
+   *  `cdpResolveXPath` to enumerate all matches wasn't justified for v1. */
+  private async describeCdp(locator: Locator): Promise<DescribeResult> {
+    const send = (m: string, p?: Record<string, unknown>) =>
+      this.sendCmd(this.tabTarget, m, p);
+    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
+    if (!nodeId) return { matchCount: 0, matches: [] };
+
+    const resolved = await send('DOM.resolveNode', { nodeId });
+    const objectId = resolved?.object?.objectId;
+    if (!objectId) return { matchCount: 0, matches: [] };
+
+    try {
+      const res = await send('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function () {
+          var classes = [];
+          if (this.className) {
+            var s = typeof this.className === 'string'
+              ? this.className
+              : (this.className.baseVal || '');
+            classes = s.split(/\\s+/).filter(Boolean);
+          }
+          var text = '';
+          try { text = (this.innerText || this.textContent || '').trim(); } catch (e) {}
+          if (text.length > 60) text = text.slice(0, 60) + '…';
+          var out = {
+            frame: location.href,
+            tag: this.tagName || '',
+            classes: classes,
+            text: text,
+          };
+          if (this.id) out.id = this.id;
+          if (this.name) out.name = this.name;
+          return out;
+        }`,
+        returnByValue: true,
+      });
+      const match = res?.result?.value as DescribeMatch | undefined;
+      if (!match) return { matchCount: 0, matches: [] };
+      return { matchCount: 1, matches: [match] };
+    } finally {
+      await send('Runtime.releaseObject', { objectId }).catch(() => {});
+    }
   }
 
   async waitFor(

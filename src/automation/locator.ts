@@ -396,6 +396,87 @@ export function buildResolveExpression(locator: Locator): string {
   })()`;
 }
 
+/**
+ * IIFE for the `describe` action — enumerates every match across light DOM,
+ * open shadow roots, and same-origin iframes. Returns `{matchCount, matches}`
+ * where `matches` is capped at the first 5 (the count is exact). Closed
+ * shadow roots are invisible to this; the CDP path in `page.describe`
+ * handles those.
+ *
+ * Two correctness things baked in:
+ *   - Per-root `document.evaluate` with `UNORDERED_NODE_SNAPSHOT_TYPE` so a
+ *     single element can't be counted twice across the main doc + a shadow
+ *     walk (each evaluation is scoped to its root).
+ *   - SVG `className` is an `SVGAnimatedString`, not a string — we read
+ *     `.baseVal` as a fallback so the IIFE doesn't crash on pages with
+ *     SVG matches.
+ */
+export function buildDescribeExpression(locator: Locator): string {
+  const xpLit = JSON.stringify(locator.xpath);
+  return `(() => {
+    function metadata(el, frame) {
+      var classes = [];
+      if (el.className) {
+        var s = typeof el.className === 'string'
+          ? el.className
+          : (el.className.baseVal || '');
+        classes = s.split(/\\s+/).filter(Boolean);
+      }
+      var text = '';
+      try { text = (el.innerText || el.textContent || '').trim(); } catch (e) {}
+      if (text.length > 60) text = text.slice(0, 60) + '…';
+      var out = {
+        frame: frame,
+        tag: el.tagName || '',
+        classes: classes,
+        text: text,
+      };
+      if (el.id) out.id = el.id;
+      if (el.name) out.name = el.name;
+      return out;
+    }
+    function evalAll(root, xp) {
+      try {
+        var doc = root.ownerDocument || (root.nodeType === 9 ? root : document);
+        var res = doc.evaluate(xp, root, null, XPathResult.UNORDERED_NODE_SNAPSHOT_TYPE, null);
+        var out = [];
+        for (var i = 0; i < res.snapshotLength; i++) {
+          out.push(res.snapshotItem(i));
+        }
+        return out;
+      } catch (e) { return []; }
+    }
+    function walkAll(root, xp, frame, matches) {
+      var direct = evalAll(root, xp);
+      for (var i = 0; i < direct.length; i++) {
+        matches.push(metadata(direct[i], frame));
+      }
+      var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+      for (var j = 0; j < all.length; j++) {
+        var node = all[j];
+        if (node.shadowRoot) {
+          walkAll(node.shadowRoot, xp, frame + ' (shadow)', matches);
+        }
+        if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+          try {
+            var idoc = node.contentDocument;
+            if (idoc) {
+              var iframeUrl = (idoc.location && idoc.location.href) || (frame + ' (iframe)');
+              walkAll(idoc, xp, iframeUrl, matches);
+            }
+          } catch (e) {}
+        }
+      }
+    }
+    var matches = [];
+    walkAll(document, ${xpLit}, location.href, matches);
+    return {
+      matchCount: matches.length,
+      matches: matches.slice(0, 5),
+    };
+  })()`;
+}
+
 export function buildActionExpression(
   locator: Locator,
   mode: Mode,
