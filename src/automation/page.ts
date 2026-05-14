@@ -505,6 +505,45 @@ export class Page {
     this.log('success', `Pressed "${key}".`);
   }
 
+  /**
+   * Arbitrary JS evaluation in the main frame. Used by the `evaluate` action
+   * as the user-facing escape hatch when no specialised action fits.
+   *
+   * `returnByValue:true` so the result comes back as JSON. `awaitPromise:true`
+   * so the user's expression can be async without extra ceremony. If the
+   * expression throws, we surface the description from `exceptionDetails`.
+   *
+   * Result is serialised to a string (the shape `ctx.outputs` stores):
+   *   - null / undefined  → ""
+   *   - string            → as-is
+   *   - number / boolean  → String()
+   *   - object / array    → JSON.stringify()
+   */
+  async evaluate(
+    expression: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<string> {
+    const params: Record<string, unknown> = {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    };
+    // CDP timeout applies to the awaitPromise wait. Omit when not set so a
+    // long-running expression isn't truncated unless the user asked for it.
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      params.timeout = opts.timeoutMs;
+    }
+    const res = await this.sendCmd<any>(this.tabTarget, 'Runtime.evaluate', params);
+    if (res?.exceptionDetails) {
+      const desc =
+        res.exceptionDetails.exception?.description ??
+        res.exceptionDetails.text ??
+        'evaluation failed';
+      throw new Error(`evaluate: ${desc}`);
+    }
+    return serializeEvalResult(res?.result?.value);
+  }
+
   private async runAction(
     locator: Locator,
     mode: Mode,
@@ -1098,6 +1137,25 @@ function anyClosedShadow(node: any): boolean {
 
 function isDomTarget(type: string | undefined): boolean {
   return type === 'iframe' || type === 'page';
+}
+
+/**
+ * Coerce a Runtime.evaluate result into a string for `ctx.outputs` storage.
+ * Outputs are `Record<string, string>`, so non-string values need a stable
+ * representation. JSON.stringify covers objects / arrays; we strip null /
+ * undefined to empty so a downstream `{{var}}` substitution doesn't render
+ * literal "null".
+ */
+function serializeEvalResult(value: unknown): string {
+  if (value == null) return '';
+  const t = typeof value;
+  if (t === 'string') return value as string;
+  if (t === 'number' || t === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 /**
