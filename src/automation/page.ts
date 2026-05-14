@@ -489,7 +489,12 @@ export class Page {
           ? 'pierceClosed=true — going straight to CDP DOM walk.'
           : 'Closed shadow detected — going straight to CDP DOM walk.',
       );
-      return await this.cdpFindAndAct(locator, mode, opts);
+      return await this.cdpFindAndActPolling(
+        locator,
+        mode,
+        opts,
+        timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS,
+      );
     }
 
     const expression = buildActionExpression(locator, mode, opts);
@@ -504,12 +509,53 @@ export class Page {
 
     this.log('info', 'Fast path missed — trying CDP DOM walk for closed shadow roots…');
     try {
-      return await this.cdpFindAndAct(locator, mode, opts);
+      return await this.cdpFindAndActPolling(
+        locator,
+        mode,
+        opts,
+        timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS,
+      );
     } catch (cdpErr: any) {
       if (cdpErr instanceof FatalActionError) throw cdpErr;
       this.log('info', `CDP fallback also failed: ${cdpErr?.message ?? cdpErr}`);
       throw fastErr;
     }
+  }
+
+  /**
+   * Poll `cdpFindAndAct` until it succeeds or `timeoutMs` elapses. Each
+   * attempt does a fresh `DOM.getDocument({pierce:true})` walk + per-root
+   * resolution, so this is the CDP-side analog of `runUntilFound`. Needed
+   * because SPA navigations (Shepherd's `/invoices/edit` → `/take-payment`
+   * route change) take measurable time to render the closed-shadow subtree
+   * after the URL changes — a single attempt right after the click loses the
+   * race. Polling at ~500ms intervals lines up with the fast-path cadence.
+   *
+   * `FatalActionError` (e.g. element exists but is `disabled`) short-circuits
+   * the loop — retrying won't change the verdict.
+   */
+  private async cdpFindAndActPolling(
+    locator: Locator,
+    mode: Mode,
+    opts: { value?: string } & GetOptions,
+    timeoutMs: number,
+  ): Promise<FrameResult> {
+    const deadline = Date.now() + timeoutMs;
+    let lastErr: Error | null = null;
+    while (true) {
+      try {
+        return await this.cdpFindAndAct(locator, mode, opts);
+      } catch (err) {
+        if (err instanceof FatalActionError) throw err;
+        lastErr = err as Error;
+        if (Date.now() >= deadline) break;
+        await sleep(500);
+      }
+    }
+    throw (
+      lastErr ??
+      new Error(`CDP DOM walk: no match within ${Math.round(timeoutMs / 1000)}s.`)
+    );
   }
 
   // ---------- fast path: Runtime.evaluate across frames ----------

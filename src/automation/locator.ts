@@ -112,14 +112,48 @@ export function buildCallFunctionExpression(
           name: this.name || this.id || '',
         };
       }
-      this.focus();
-      const proto = Object.getPrototypeOf(this);
-      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-      const setter = desc && desc.set;
-      if (setter) setter.call(this, ${valueLiteral});
-      else this.value = ${valueLiteral};
-      this.dispatchEvent(new Event('input', { bubbles: true }));
-      this.dispatchEvent(new Event('change', { bubbles: true }));
+      if (this.isContentEditable) {
+        // Contenteditable branch: select all existing content, then try
+        // execCommand('insertText') (plain contenteditable) with a beforeinput
+        // fallback (Lexical / ProseMirror / Slate). composed:true so the
+        // beforeinput escapes shadow roots up to the framework's listener.
+        this.focus();
+        try {
+          var __view = this.ownerDocument && this.ownerDocument.defaultView;
+          var __sel = __view ? __view.getSelection() : null;
+          if (__sel) {
+            var __range = this.ownerDocument.createRange();
+            __range.selectNodeContents(this);
+            __sel.removeAllRanges();
+            __sel.addRange(__range);
+          }
+        } catch (e) {}
+        var __ok = false;
+        try {
+          __ok = this.ownerDocument.execCommand('insertText', false, ${valueLiteral});
+        } catch (e) {}
+        if (!__ok) {
+          try {
+            this.dispatchEvent(new InputEvent('beforeinput', {
+              inputType: 'insertText',
+              data: ${valueLiteral},
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+            }));
+          } catch (e) {}
+        }
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        this.focus();
+        const proto = Object.getPrototypeOf(this);
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        const setter = desc && desc.set;
+        if (setter) setter.call(this, ${valueLiteral});
+        else this.value = ${valueLiteral};
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
+      }
     `;
   } else if (mode === 'click') {
     actionBlock = `
@@ -290,14 +324,46 @@ export function buildActionExpression(
           name: el.name || el.id || '',
         };
       }
-      el.focus();
-      const proto = Object.getPrototypeOf(el);
-      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-      const setter = desc && desc.set;
-      if (setter) setter.call(el, ${valueLiteral});
-      else el.value = ${valueLiteral};
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      if (el.isContentEditable) {
+        // Mirror of the CDP path's contenteditable branch in
+        // buildCallFunctionExpression — keep these two in lockstep.
+        el.focus();
+        try {
+          var __view = el.ownerDocument && el.ownerDocument.defaultView;
+          var __sel = __view ? __view.getSelection() : null;
+          if (__sel) {
+            var __range = el.ownerDocument.createRange();
+            __range.selectNodeContents(el);
+            __sel.removeAllRanges();
+            __sel.addRange(__range);
+          }
+        } catch (e) {}
+        var __ok = false;
+        try {
+          __ok = el.ownerDocument.execCommand('insertText', false, ${valueLiteral});
+        } catch (e) {}
+        if (!__ok) {
+          try {
+            el.dispatchEvent(new InputEvent('beforeinput', {
+              inputType: 'insertText',
+              data: ${valueLiteral},
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+            }));
+          } catch (e) {}
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        el.focus();
+        const proto = Object.getPrototypeOf(el);
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        const setter = desc && desc.set;
+        if (setter) setter.call(el, ${valueLiteral});
+        else el.value = ${valueLiteral};
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
     `;
   } else if (mode === 'click') {
     actionBlock = `
