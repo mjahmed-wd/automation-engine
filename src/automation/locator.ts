@@ -33,7 +33,11 @@ function buildFinderExpression(locator: Locator, requireVisible: boolean): strin
     ? `function visible(el) {
         const r = el.getBoundingClientRect();
         const cs = getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+        return r.width > 0 && r.height > 0
+          && cs.visibility !== 'hidden'
+          && cs.display !== 'none'
+          && parseFloat(cs.opacity) > 0
+          && cs.pointerEvents !== 'none';
       }`
     : `function visible(_el) { return true; }`;
 
@@ -161,6 +165,31 @@ export function buildCallFunctionExpression(
       const __r = this.getBoundingClientRect();
       const __cx = __r.left + __r.width / 2;
       const __cy = __r.top + __r.height / 2;
+      // Mirror of buildActionExpression's overlay hit-test. Currently dead in
+      // page.click() (which routes closed-shadow to cdpTrustedClick instead of
+      // cdpFindAndAct), but kept in lockstep so a future regression doesn't
+      // drift behavior between fast and CDP paths.
+      try {
+        const __root = this.getRootNode();
+        const __efp = (__root && typeof __root.elementsFromPoint === 'function'
+          ? __root.elementsFromPoint(__cx, __cy)
+          : document.elementsFromPoint(__cx, __cy));
+        const __top = __efp && __efp[0];
+        if (__top && !this.contains(__top)) {
+          var __tag = this.tagName ? this.tagName.toLowerCase() : 'element';
+          var __ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
+          var __topTag = __top.tagName ? __top.tagName.toLowerCase() : 'element';
+          return {
+            ok: false,
+            fatal: true,
+            reason: 'covered',
+            message: 'Cannot click ' + __tag + __ident + ': covered by <' + __topTag + '>',
+            frame: location.href,
+            tag: this.tagName,
+            name: this.name || this.id || '',
+          };
+        }
+      } catch (e) {}
       const __opts = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, clientX: __cx, clientY: __cy };
       const __popts = Object.assign({}, __opts, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
       const __dispatch = (Ctor, type, init) => { try { this.dispatchEvent(new Ctor(type, init)); } catch (e) {} };
@@ -240,7 +269,11 @@ export function buildResolveExpression(locator: Locator): string {
     function visible(el) {
       const r = el.getBoundingClientRect();
       const cs = getComputedStyle(el);
-      return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+      return r.width > 0 && r.height > 0
+        && cs.visibility !== 'hidden'
+        && cs.display !== 'none'
+        && parseFloat(cs.opacity) > 0
+        && cs.pointerEvents !== 'none';
     }
     function evalIn(root, xp) {
       try {
@@ -282,10 +315,38 @@ export function buildResolveExpression(locator: Locator): string {
     }
     try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
     const r = el.getBoundingClientRect();
+    const __cx = r.left + r.width / 2;
+    const __cy = r.top + r.height / 2;
+    // Overlay hit-test. elementsFromPoint returns elements at (cx,cy) front-to-back.
+    // If the topmost element is el itself or a descendant of el (click bubbles
+    // up), we're clear. Anything else means a sibling/overlay would absorb the
+    // click — bail with fatal:true. Scoped to el.getRootNode() so closed-shadow
+    // siblings get caught instead of just the shadow host.
+    try {
+      const __root = el.getRootNode();
+      const __efp = (__root && typeof __root.elementsFromPoint === 'function'
+        ? __root.elementsFromPoint(__cx, __cy)
+        : document.elementsFromPoint(__cx, __cy));
+      const __top = __efp && __efp[0];
+      if (__top && !el.contains(__top)) {
+        var __tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+        var __ident = el.name ? '[name="' + el.name + '"]' : (el.id ? '#' + el.id : '');
+        var __topTag = __top.tagName ? __top.tagName.toLowerCase() : 'element';
+        return {
+          ok: false,
+          fatal: true,
+          reason: 'covered',
+          message: 'Cannot click ' + __tag + __ident + ': covered by <' + __topTag + '>',
+          frame: location.href,
+          tag: el.tagName,
+          name: el.name || el.id || '',
+        };
+      }
+    } catch (e) {}
     return {
       ok: true,
-      x: r.left + r.width / 2,
-      y: r.top + r.height / 2,
+      x: __cx,
+      y: __cy,
       frame: location.href,
       tag: el.tagName,
       name: el.name || el.id || '',
@@ -371,6 +432,28 @@ export function buildActionExpression(
       const __r = el.getBoundingClientRect();
       const __cx = __r.left + __r.width / 2;
       const __cy = __r.top + __r.height / 2;
+      // Overlay hit-test — see buildResolveExpression for the rationale.
+      try {
+        const __root = el.getRootNode();
+        const __efp = (__root && typeof __root.elementsFromPoint === 'function'
+          ? __root.elementsFromPoint(__cx, __cy)
+          : document.elementsFromPoint(__cx, __cy));
+        const __top = __efp && __efp[0];
+        if (__top && !el.contains(__top)) {
+          var __tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+          var __ident = el.name ? '[name="' + el.name + '"]' : (el.id ? '#' + el.id : '');
+          var __topTag = __top.tagName ? __top.tagName.toLowerCase() : 'element';
+          return {
+            ok: false,
+            fatal: true,
+            reason: 'covered',
+            message: 'Cannot click ' + __tag + __ident + ': covered by <' + __topTag + '>',
+            frame: location.href,
+            tag: el.tagName,
+            name: el.name || el.id || '',
+          };
+        }
+      } catch (e) {}
       const __opts = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, clientX: __cx, clientY: __cy };
       const __popts = Object.assign({}, __opts, { pointerType: 'mouse', pointerId: 1, isPrimary: true });
       const __dispatch = (Ctor, type, init) => { try { el.dispatchEvent(new Ctor(type, init)); } catch (e) {} };

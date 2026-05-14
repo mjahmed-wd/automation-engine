@@ -292,13 +292,16 @@ export class Page {
     try {
       resolved = await this.runUntilFound(resolveExpr, timeout);
     } catch (fastErr) {
-      // Click can't produce fatal in Batch 1, but stay symmetric with fill so
-      // Batch 3's overlay check propagates correctly without revisiting this.
+      // Fast-path resolve returned fatal (overlay-covered, or future
+      // fill/click rejections) — no point asking CDP to re-confirm.
       if (fastErr instanceof FatalActionError) throw fastErr;
       this.log('info', 'Fast-path resolve missed — trying CDP DOM walk.');
       try {
         result = await this.cdpTrustedClick(locator);
-      } catch {
+      } catch (cdpErr) {
+        // Prefer a fatal message from CDP (e.g. "covered by <div>") over the
+        // generic "Locator not found" we'd otherwise surface.
+        if (cdpErr instanceof FatalActionError) throw cdpErr;
         throw fastErr;
       }
       // Fast path missed but CDP found it — likely a closed shadow root we
@@ -345,16 +348,54 @@ export class Page {
       throw new Error(`No match found for '${locator.xpath}' via CDP DOM walk.`);
     }
 
-    // Scroll into view via callFunctionOn on the resolved object.
+    // Scroll into view + overlay hit-test in a single callFunctionOn to avoid a
+    // second round-trip. The in-page function returns either {ok:true} or, if
+    // some other element would absorb a click at the target center,
+    // {ok:false, fatal:true, reason:'covered', message:...} — we surface that
+    // as a FatalActionError so page.click()'s caller sees a clear reason
+    // instead of a vague CDP failure.
     const resolved = await send('DOM.resolveNode', { nodeId });
     const objectId = resolved?.object?.objectId;
     if (objectId) {
       try {
-        await send('Runtime.callFunctionOn', {
+        const checkRes = await send('Runtime.callFunctionOn', {
           objectId,
-          functionDeclaration:
-            'function () { this.scrollIntoView({ block: "center", inline: "center" }); }',
+          functionDeclaration: `function () {
+            this.scrollIntoView({ block: 'center', inline: 'center' });
+            const r = this.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            try {
+              const root = this.getRootNode();
+              const efp = (root && typeof root.elementsFromPoint === 'function'
+                ? root.elementsFromPoint(cx, cy)
+                : document.elementsFromPoint(cx, cy));
+              const top = efp && efp[0];
+              if (top && !this.contains(top)) {
+                const tag = this.tagName ? this.tagName.toLowerCase() : 'element';
+                const ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
+                const topTag = top.tagName ? top.tagName.toLowerCase() : 'element';
+                return {
+                  ok: false,
+                  fatal: true,
+                  reason: 'covered',
+                  message: 'Cannot click ' + tag + ident + ': covered by <' + topTag + '>',
+                  frame: location.href,
+                  tag: this.tagName,
+                  name: this.name || this.id || '',
+                };
+              }
+            } catch (e) {}
+            return { ok: true };
+          }`,
+          returnByValue: true,
         });
+        const out = checkRes?.result?.value as FrameResult | undefined;
+        if (out?.fatal) {
+          throw new FatalActionError(
+            out.message ?? `Click target is ${out.reason ?? 'rejected'}`,
+          );
+        }
       } finally {
         await send('Runtime.releaseObject', { objectId }).catch(() => {});
       }
