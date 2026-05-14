@@ -98,6 +98,35 @@ export interface PressStep extends BaseStep {
 }
 
 /**
+ * Programmatically pick option(s) in a native `<select>`. Setting
+ * `select.value` (single) or `option.selected` (multi) is much more reliable
+ * than clicking — native select dropdowns render as an OS-level popup that
+ * doesn't accept synthetic clicks.
+ *
+ * Match by exactly one of:
+ *   - `value`: matches `option.value` (the value attribute / submitted value)
+ *   - `label`: matches `option.label` (the visible text)
+ *
+ * Either can be a string (single match) or an array (multi-select).
+ *
+ * Multi-select semantics are "set to exactly these" — any option whose
+ * value/label isn't in the wanted set gets unselected. (Playwright-style.)
+ *
+ *   { "action": "selectOption", "xpath": "//select[@id='country']", "label": "Bangladesh" }
+ *   { "action": "selectOption", "xpath": "//select[@multiple]", "value": ["red", "blue"] }
+ */
+export interface SelectOptionStep extends BaseStep {
+  action: 'selectOption';
+  xpath: string;
+  value?: string | string[];
+  label?: string | string[];
+  /** Accepted for parity; `cdpResolveXPath` already pierces closed shadow. */
+  pierceClosed?: boolean;
+  /** How long to poll for the select to appear in the DOM. Default 20s. */
+  timeoutMs?: number;
+}
+
+/**
  * Inject files into a real `<input type="file">` via CDP
  * `DOM.setFileInputFiles`. There's no page-JS equivalent — `input.files` is
  * read-only and synthetic clicks can't open the native OS picker. This is the
@@ -158,7 +187,8 @@ export type AutomationStep =
   | WaitForStep
   | PressStep
   | EvaluateStep
-  | UploadStep;
+  | UploadStep
+  | SelectOptionStep;
 
 /** Tag identifies which sidepanel tab a script's example belongs in. */
 export type AutomationTag = 'action' | 'get';
