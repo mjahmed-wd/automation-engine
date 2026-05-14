@@ -1,0 +1,1058 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Automation fixture — all content</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; padding: 24px; max-width: 920px; margin: 0 auto; color: #222; }
+    h1 { font-size: 24px; margin: 0 0 6px; }
+    .lead { color: #555; font-size: 13px; margin: 0 0 8px; }
+    .lead a { color: #06c; }
+    section { border: 1px solid #d8d8d8; padding: 14px 18px; margin: 14px 0; border-radius: 6px; background: #fafafa; }
+    section h2 { margin: 0 0 4px; font-size: 15px; color: #222; display: flex; align-items: center; gap: 8px; }
+    .tag { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; background: #dde; color: #335; padding: 2px 6px; border-radius: 3px; }
+    .tag.fatal { background: #fdd; color: #800; }
+    .use-case { color: #666; font-size: 13px; margin: 0 0 12px; font-style: italic; }
+    .widget { padding: 8px 0; }
+    .result { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #060; margin-top: 6px; min-height: 1.3em; }
+    .bad { color: #b00; font-weight: bold; }
+    input, select, button, textarea { font: inherit; padding: 4px 8px; }
+    select[multiple] { padding: 0; min-width: 180px; }
+    code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+
+    .scenarios { margin-top: 14px; }
+    .scenario {
+      background: white; border: 1px solid #d0d0d0; border-radius: 5px;
+      padding: 10px 12px; margin-top: 10px;
+    }
+    .scenario h3 { margin: 0 0 6px; font-size: 12px; color: #333; font-weight: 600; }
+    .scenario pre {
+      background: #1e1e1e; color: #e8e8e8; padding: 10px 12px; border-radius: 4px;
+      font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; line-height: 1.5;
+      overflow-x: auto; margin: 0 0 8px;
+    }
+    .scenario-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+    .copy-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #06c; color: white; border: 0; padding: 5px 10px; font-size: 12px;
+      border-radius: 4px; cursor: pointer;
+    }
+    .copy-btn:hover { background: #048; }
+    .copy-btn.copied { background: #060; }
+    .copy-btn.needs-manual { background: #a60; }
+    .copy-btn.needs-manual:hover { background: #850; }
+    .expected { font-size: 12px; color: #444; margin: 0; }
+    .expected strong { color: #222; }
+
+    .hover-host { display: inline-block; padding: 10px 14px; background: #eef; border: 1px solid #99c; border-radius: 4px; user-select: none; }
+    .hover-host .reveal { display: none; margin-left: 8px; padding: 4px 10px; background: #cfc; border: 1px solid #690; border-radius: 3px; cursor: pointer; }
+    .hover-host:hover .reveal { display: inline-block; }
+    #overlay-wrap { position: relative; display: inline-block; }
+    #overlay-wrap #overlay { position: absolute; inset: 0; background: rgba(220, 60, 60, 0.35); z-index: 99; }
+    .pointer-btn { display: inline-block; padding: 8px 14px; background: #eee; border: 1px solid #888; border-radius: 4px; cursor: pointer; user-select: none; }
+    .pointer-btn.active { background: #cfeacf; }
+    #iframe-host { width: 100%; height: 130px; }
+    #iframe-host iframe { width: 100%; height: 100%; border: 1px solid #ccc; }
+    .multi-target { margin: 2px; padding: 4px 8px; }
+  </style>
+</head>
+<body>
+  <h1>Automation fixture — all content</h1>
+  <p class="lead">Every action and locator path the engine supports, with copy-paste JSON for each. Each section has a use case, a working widget, the JSON to test it, and the expected outcome. Use this as both a regression target and a documentation cookbook.</p>
+  <p class="lead">Run <code>phase4-fixture-smoke.json</code> to exercise every happy-path scenario in one sweep. Reload this page right before running so §19's delayed-render is in flight.</p>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>1. Plain text input <span class="tag">fill</span></h2>
+    <p class="use-case">The bread-and-butter form fill — types into an <code>&lt;input&gt;</code>. Uses React-aware value setters internally.</p>
+    <div class="widget">
+      <input id="plain-input" type="text" placeholder="fill me">
+      <p class="result" id="result-plain-input">not filled</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fill plain text input",
+  "tag": "action",
+  "steps": [
+    { "action": "fill", "xpath": "//input[@id='plain-input']", "value": "hello world" },
+    { "action": "get",  "xpath": "//p[@id='result-plain-input']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>filled: hello world</code>; <code>out</code> saves the same.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('plain-input').addEventListener('input', function (e) {
+        document.getElementById('result-plain-input').textContent = 'filled: ' + e.target.value;
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>2. Disabled input <span class="tag fatal">fill → fatal</span></h2>
+    <p class="use-case">Phase 1 fatal-rejection: filling a disabled input fails fast instead of polling for 20s. Value stays <code>locked</code>.</p>
+    <div class="widget">
+      <input id="disabled-input" name="disabled-input" disabled value="locked">
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: fill disabled",
+  "tag": "action",
+  "steps": [
+    { "action": "fill", "xpath": "//input[@id='disabled-input']", "value": "should never land" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fast fatal <code>Cannot fill input[name="disabled-input"]: it is disabled</code> in &lt;1s.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>3. Read-only input <span class="tag fatal">fill → fatal</span></h2>
+    <p class="use-case">Same fast-fatal pattern as disabled, but the error reads <code>read-only</code> instead.</p>
+    <div class="widget">
+      <input id="readonly-input" name="readonly-input" readonly value="locked">
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: fill readonly",
+  "tag": "action",
+  "steps": [
+    { "action": "fill", "xpath": "//input[@id='readonly-input']", "value": "should never land" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fast fatal <code>Cannot fill input[name="readonly-input"]: it is read-only</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>4. Native single &lt;select&gt; <span class="tag">selectOption</span></h2>
+    <p class="use-case">Native selects can't be reliably driven by clicks (OS popup intercepts). Sets <code>select.value</code> and dispatches <code>change</code>.</p>
+    <div class="widget">
+      <select id="single-select" name="single-select">
+        <option value="">-- pick one --</option>
+        <option value="red">Red</option>
+        <option value="green">Green</option>
+        <option value="blue">Blue</option>
+        <option value="yellow">Yellow</option>
+      </select>
+      <p class="result" id="result-single">nothing selected</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <h3>Happy path — pick by label</h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "selectOption single by label",
+  "tag": "action",
+  "steps": [
+    { "action": "selectOption", "xpath": "//select[@id='single-select']", "label": "Green" },
+    { "action": "get", "xpath": "//p[@id='result-single']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> <code>Selected 1 option …</code>; result becomes <code>chose: green (Green)</code>.</p>
+      </div>
+      <div class="scenario">
+        <h3>Fatal — no matching option <span class="tag fatal">fatal</span></h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: selectOption no-match",
+  "tag": "action",
+  "steps": [
+    { "action": "selectOption", "xpath": "//select[@id='single-select']", "label": "Magenta" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fast fatal <code>selectOption: no option matched ["Magenta"] (by label).</code></p>
+      </div>
+      <div class="scenario">
+        <h3>Fatal — target is not a &lt;select&gt; <span class="tag fatal">fatal</span></h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: selectOption not-a-select",
+  "tag": "action",
+  "steps": [
+    { "action": "selectOption", "xpath": "//div[@id='evaluate-target']", "value": "x" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fast fatal <code>selectOption: target is not &lt;select&gt; (got &lt;div&gt;).</code></p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('single-select').addEventListener('change', function () {
+        var o = this.options[this.selectedIndex];
+        document.getElementById('result-single').textContent =
+          o && o.value ? ('chose: ' + o.value + ' (' + o.textContent + ')') : 'nothing selected';
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>5. Native multi &lt;select&gt; <span class="tag">selectOption multi</span></h2>
+    <p class="use-case">Multi-select uses "set to exactly these" semantics — anything not in the array gets unselected.</p>
+    <div class="widget">
+      <select id="multi-select" name="multi-select" multiple size="5">
+        <option value="apple">Apple</option>
+        <option value="banana">Banana</option>
+        <option value="cherry">Cherry</option>
+        <option value="date">Date</option>
+        <option value="elderberry">Elderberry</option>
+      </select>
+      <p class="result" id="result-multi">nothing selected</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "selectOption multi by value",
+  "tag": "action",
+  "steps": [
+    { "action": "selectOption", "xpath": "//select[@id='multi-select']", "value": ["apple", "cherry"] },
+    { "action": "get", "xpath": "//p[@id='result-multi']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> <code>Selected 2 options …</code>; result becomes <code>chose: apple, cherry</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('multi-select').addEventListener('change', function () {
+        var sel = Array.prototype.slice.call(this.selectedOptions).map(function (o) { return o.value; });
+        document.getElementById('result-multi').textContent =
+          sel.length ? ('chose: ' + sel.join(', ')) : 'nothing selected';
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>6. File input <span class="tag">upload</span></h2>
+    <p class="use-case">File attachments — uses CDP <code>DOM.setFileInputFiles</code>. The path must be absolute on the machine running Chrome.</p>
+    <div class="widget">
+      <input id="file-input" type="file" name="upload-file">
+      <p class="result" id="result-upload">no file</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <h3>Happy path — replace the path</h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "upload a file",
+  "tag": "action",
+  "steps": [
+    { "action": "upload", "xpath": "//input[@id='file-input']", "files": "/Users/metadesign/Desktop/sample.txt" },
+    { "action": "get",    "xpath": "//p[@id='result-upload']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>attached: sample.txt</code>. Edit the path to a real file on your machine first.</p>
+      </div>
+      <div class="scenario">
+        <h3>Fatal — pointing at a non-file-input <span class="tag fatal">fatal</span></h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: upload wrong target",
+  "tag": "action",
+  "steps": [
+    { "action": "upload",
+      "xpath": "//button[@id='confirm-btn']",
+      "files": "/Users/metadesign/Desktop/sample.txt" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fast fatal <code>upload: target is not an &lt;input type="file"&gt; (got &lt;button&gt;). …</code></p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('file-input').addEventListener('change', function () {
+        var f = this.files && this.files[0];
+        document.getElementById('result-upload').textContent = f ? ('attached: ' + f.name) : 'no file';
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>7. Plain contenteditable <span class="tag">fill via execCommand</span></h2>
+    <p class="use-case">Rich-text editors that respect <code>execCommand('insertText')</code> — most plain contenteditables.</p>
+    <div class="widget">
+      <div id="ce-plain" contenteditable="true" style="min-width:300px;min-height:30px;padding:6px;border:1px solid #aaa;border-radius:4px;background:white">initial plain text</div>
+      <p class="result" id="result-ce-plain">unchanged</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fill plain contenteditable",
+  "tag": "action",
+  "steps": [
+    { "action": "fill", "xpath": "//div[@id='ce-plain']", "value": "rich text here" },
+    { "action": "get",  "xpath": "//p[@id='result-ce-plain']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>ce-plain: rich text here</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('ce-plain').addEventListener('input', function () {
+        document.getElementById('result-ce-plain').textContent = 'ce-plain: ' + this.textContent;
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>8. Lexical-style contenteditable <span class="tag">fill via beforeinput</span></h2>
+    <p class="use-case">Modern editors (Lexical / ProseMirror / Slate) intercept <code>beforeinput</code> and apply changes through their model. The fill action falls back to dispatching <code>beforeinput</code> when execCommand returns false.</p>
+    <div class="widget">
+      <div id="ce-lexical" contenteditable="true" style="min-width:300px;min-height:30px;padding:6px;border:1px solid #aaa;border-radius:4px;background:white">initial lexical content</div>
+      <p class="result" id="result-ce-lexical">unchanged</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fill Lexical contenteditable",
+  "tag": "action",
+  "steps": [
+    { "action": "fill", "xpath": "//div[@id='ce-lexical']", "value": "lexical input" },
+    { "action": "get",  "xpath": "//p[@id='result-ce-lexical']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>[lexical-applied] lexical input</code> — proves the beforeinput listener fired.</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var el = document.getElementById('ce-lexical');
+        el.addEventListener('beforeinput', function (e) {
+          if (e.inputType === 'insertText') {
+            e.preventDefault();
+            el.textContent = '[lexical-applied] ' + (e.data || '');
+            document.getElementById('result-ce-lexical').textContent = el.textContent;
+          }
+        }, true);
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>9. Pointer-only custom dropdown <span class="tag">click (pointer-sequence)</span></h2>
+    <p class="use-case">react-select / MUI / Headless UI dropdowns gate on <code>pointerdown</code>, not <code>mousedown</code>. The trusted CDP click path fires the full pointer/mouse cascade.</p>
+    <div class="widget">
+      <div class="pointer-btn" id="pointer-btn">Open dropdown</div>
+      <p class="result" id="result-pointer">closed</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "click pointer-only dropdown",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//div[@id='pointer-btn']" },
+    { "action": "get",   "xpath": "//p[@id='result-pointer']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>opened (pointerdown fired)</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('pointer-btn').addEventListener('pointerdown', function () {
+        this.classList.add('active');
+        document.getElementById('result-pointer').textContent = 'opened (pointerdown fired)';
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>10. Overlay-covered button <span class="tag fatal">click → fatal</span></h2>
+    <p class="use-case">Phase 3 hit-test: before dispatching a trusted click, we check what's at the target's center via <code>elementsFromPoint</code>. If an overlay covers it, fail fast instead of clicking through.</p>
+    <div class="widget">
+      <div id="overlay-wrap">
+        <button id="covered-btn" name="covered-btn" type="button">Click me (covered)</button>
+        <div id="overlay" title="overlay"></div>
+      </div>
+      <p class="result" id="result-covered">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: click covered",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//button[@id='covered-btn']" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fast fatal <code>Cannot click button[name="covered-btn"]: covered by &lt;div&gt;</code>. Result line stays <code>not clicked</code>. A red <code>BUG</code> message means the hit-test regressed.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('covered-btn').addEventListener('click', function () {
+        var r = document.getElementById('result-covered');
+        r.textContent = 'BUG — click landed on covered button';
+        r.classList.add('bad');
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>11. Hover-reveal button <span class="tag">hover then click</span></h2>
+    <p class="use-case">Bootstrap dropdowns, admin table-row actions, GitHub commit-row buttons — the child is <code>display:none</code> until <code>:hover</code> on the parent. Only the trusted CDP cursor move fires CSS <code>:hover</code>.</p>
+    <div class="widget">
+      <div class="hover-host" id="hover-host">
+        Hover me
+        <button class="reveal" id="reveal-btn" type="button">Click revealed</button>
+      </div>
+      <p class="result" id="result-hover">not yet</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "hover-then-click",
+  "tag": "action",
+  "steps": [
+    { "action": "hover", "xpath": "//div[@id='hover-host']" },
+    { "action": "click", "xpath": "//button[@id='reveal-btn']", "timeoutMs": 5000 },
+    { "action": "get",   "xpath": "//p[@id='result-hover']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>clicked after hover</code>. If it stays <code>not yet</code>, the trusted hover didn't trigger CSS <code>:hover</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('reveal-btn').addEventListener('click', function () {
+        document.getElementById('result-hover').textContent = 'clicked after hover';
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>12. confirm() button <span class="tag">dialog</span></h2>
+    <p class="use-case">Default behavior auto-accepts so scripts don't hang. Use <code>{ "action": "dialog", "accept": false }</code> immediately before the trigger to cancel instead.</p>
+    <div class="widget">
+      <button id="confirm-btn" type="button">Trigger confirm()</button>
+      <p class="result" id="result-confirm">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <h3>Auto-accept (default)</h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "dialog confirm auto-accept",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//button[@id='confirm-btn']" },
+    { "action": "get",   "xpath": "//p[@id='result-confirm']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log includes <code>Dialog confirm("Proceed?") → accept (default)</code>; result becomes <code>confirmed: yes</code>.</p>
+      </div>
+      <div class="scenario">
+        <h3>Explicit cancel</h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "dialog cancel",
+  "tag": "action",
+  "steps": [
+    { "action": "dialog", "accept": false },
+    { "action": "click",  "xpath": "//button[@id='confirm-btn']" },
+    { "action": "get",    "xpath": "//p[@id='result-confirm']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log includes <code>Next dialog armed → cancel</code>; result becomes <code>confirmed: no</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('confirm-btn').addEventListener('click', function () {
+        var r = confirm('Proceed?');
+        document.getElementById('result-confirm').textContent = 'confirmed: ' + (r ? 'yes' : 'no');
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>13. alert() button <span class="tag">dialog auto-dismiss</span></h2>
+    <p class="use-case">Alert dialogs are auto-dismissed by the default handler so the next line of page-JS runs.</p>
+    <div class="widget">
+      <button id="alert-btn" type="button">Trigger alert()</button>
+      <p class="result" id="result-alert">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "dialog alert auto-dismiss",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//button[@id='alert-btn']" },
+    { "action": "get",   "xpath": "//p[@id='result-alert']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>alert dismissed</code>; log includes <code>Dialog alert("Hello…") → accept (default)</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('alert-btn').addEventListener('click', function () {
+        alert('Hello from the fixture!');
+        document.getElementById('result-alert').textContent = 'alert dismissed';
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>14. prompt() button <span class="tag">dialog with promptText</span></h2>
+    <p class="use-case">For <code>prompt()</code> dialogs, arm a response with <code>{ "action": "dialog", "accept": true, "promptText": "…" }</code> before the trigger.</p>
+    <div class="widget">
+      <button id="prompt-btn" type="button">Trigger prompt()</button>
+      <p class="result" id="result-prompt">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "dialog prompt response",
+  "tag": "action",
+  "steps": [
+    { "action": "dialog", "accept": true, "promptText": "Jubair" },
+    { "action": "click",  "xpath": "//button[@id='prompt-btn']" },
+    { "action": "get",    "xpath": "//p[@id='result-prompt']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log includes <code>Next dialog armed → accept with "Jubair"</code>; result becomes <code>name: Jubair</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('prompt-btn').addEventListener('click', function () {
+        var r = prompt('Your name?', 'default');
+        document.getElementById('result-prompt').textContent =
+          r === null ? 'name: (cancelled)' : 'name: ' + r;
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>15. Twice-confirm button <span class="tag">dialog one-shot</span></h2>
+    <p class="use-case">An armed dialog response is consumed once. A second dialog in the same step's aftermath reverts to auto-accept.</p>
+    <div class="widget">
+      <button id="twice-btn" type="button">Trigger two confirms()</button>
+      <p class="result" id="result-twice">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "dialog twice (one-shot consumption)",
+  "tag": "action",
+  "steps": [
+    { "action": "dialog", "accept": false },
+    { "action": "click",  "xpath": "//button[@id='twice-btn']" },
+    { "action": "get",    "xpath": "//p[@id='result-twice']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>first: no, second: yes</code> — first dialog cancelled (consumed), second auto-accepted (default reverted).</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('twice-btn').addEventListener('click', function () {
+        var a = confirm('First?');
+        var b = confirm('Second?');
+        document.getElementById('result-twice').textContent =
+          'first: ' + (a ? 'yes' : 'no') + ', second: ' + (b ? 'yes' : 'no');
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>16. Open shadow root <span class="tag">click (shadow walk)</span></h2>
+    <p class="use-case">Web Components with <code>attachShadow({mode:'open'})</code> — the fast-path <code>deepEval</code> walks open shadow roots automatically.</p>
+    <div class="widget">
+      <div id="open-host"></div>
+      <p class="result" id="result-open-shadow">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "click in open shadow",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//button[@id='open-shadow-btn']" },
+    { "action": "get",   "xpath": "//p[@id='result-open-shadow']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>clicked inside open shadow</code>.</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var host = document.getElementById('open-host');
+        var root = host.attachShadow({ mode: 'open' });
+        var btn = document.createElement('button');
+        btn.id = 'open-shadow-btn';
+        btn.type = 'button';
+        btn.textContent = 'Click in open shadow';
+        btn.addEventListener('click', function () {
+          document.getElementById('result-open-shadow').textContent = 'clicked inside open shadow';
+        });
+        root.appendChild(btn);
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>17. Closed shadow root <span class="tag">click + pierceClosed</span></h2>
+    <p class="use-case">Web Components with <code>attachShadow({mode:'closed'})</code> — invisible to page-JS. Only the CDP DOM walk pierces. The root reference is stashed in an IIFE closure here, mimicking a real closed-shadow widget like Shepherd.</p>
+    <div class="widget">
+      <div id="closed-host"></div>
+      <p class="result" id="result-closed-shadow">not clicked</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "click in closed shadow",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//button[@id='closed-shadow-btn']", "pierceClosed": true },
+    { "action": "get",   "xpath": "//p[@id='result-closed-shadow']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log includes <code>pierceClosed=true — CDP-resolving and trusted-clicking</code>; result becomes <code>clicked inside closed shadow</code>.</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var host = document.getElementById('closed-host');
+        var root = host.attachShadow({ mode: 'closed' });
+        var btn = document.createElement('button');
+        btn.id = 'closed-shadow-btn';
+        btn.type = 'button';
+        btn.textContent = 'Click in closed shadow';
+        btn.addEventListener('click', function () {
+          document.getElementById('result-closed-shadow').textContent = 'clicked inside closed shadow';
+        });
+        root.appendChild(btn);
+        // `root` is unreachable once this IIFE returns.
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>18. Nested same-origin iframe (2 levels) <span class="tag">fill (iframe recursion)</span></h2>
+    <p class="use-case">Two iframes deep, same origin. <code>deepEval</code> recurses into <code>contentDocument</code> at each level. The result paragraph lives inside the inner iframe — the <code>get</code> step finds it via the same recursion.</p>
+    <div class="widget">
+      <div id="iframe-host"></div>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fill in nested iframe",
+  "tag": "action",
+  "steps": [
+    { "action": "fill", "xpath": "//input[@id='deep-input']", "value": "deep value" },
+    { "action": "get",  "xpath": "//p[@id='result-iframe']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log shows the iframe URL in the frame field; result paragraph in the inner iframe becomes <code>deep filled: deep value</code>.</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var host = document.getElementById('iframe-host');
+        var outer = document.createElement('iframe');
+        host.appendChild(outer);
+        var outerDoc = outer.contentDocument;
+        outerDoc.open();
+        outerDoc.write('<!doctype html><html><body style="margin:4px"><iframe style="width:100%;height:80px;border:1px solid #ccc"></iframe></body></html>');
+        outerDoc.close();
+        var inner = outerDoc.querySelector('iframe');
+        var innerDoc = inner.contentDocument;
+        innerDoc.open();
+        innerDoc.write([
+          '<!doctype html><html><body style="margin:4px;font-family:system-ui">',
+          '<input id="deep-input" placeholder="fill me (2 iframes deep)">',
+          '<p id="result-iframe" style="font-family:ui-monospace,Menlo;font-size:12px;color:#060">not filled</p>',
+          '<scr' + 'ipt>',
+          'document.getElementById("deep-input").addEventListener("input", function (e) {',
+          '  document.getElementById("result-iframe").textContent = "deep filled: " + e.target.value;',
+          '});',
+          '<\/script>',
+          '</body></html>',
+        ].join(''));
+        innerDoc.close();
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>19. Diagnostic targets <span class="tag">evaluate / waitForXPath / describe</span></h2>
+    <p class="use-case">Three different action types share this section because they're all read-only diagnostics. The evaluate target carries a data attribute; the delayed-render target appears 500ms after page load (verifies <code>goto.waitForXPath</code>); the multi-target group is 10 buttons for <code>describe</code> to enumerate.</p>
+    <div class="widget">
+      <div id="evaluate-target" data-count="42">evaluate target — <code>data-count="42"</code></div>
+      <div id="delayed-host" style="margin-top:8px;padding:6px;background:white;border:1px dashed #aaa;border-radius:4px;min-height:1.3em">
+        (empty — content arrives ~500ms after load)
+      </div>
+      <div style="margin-top:8px">
+        <p style="margin:0 0 4px;font-size:12px;color:#555">10 buttons with class <code>multi-target</code>:</p>
+        <div id="multi-target-host"></div>
+      </div>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <h3>evaluate — read a data attribute</h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "evaluate data attribute",
+  "tag": "get",
+  "steps": [
+    { "action": "evaluate", "expression": "document.getElementById('evaluate-target').dataset.count", "saveAs": "count" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log shows <code>Evaluated "42" → count</code>.</p>
+      </div>
+      <div class="scenario">
+        <h3>goto with waitForXPath — wait for delayed render</h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "goto with waitForXPath",
+  "tag": "action",
+  "steps": [
+    { "action": "goto",
+      "url": "file:///Users/metadesign/Desktop/projects/other/debug-and-automation-wxt/test-fixtures/all-content.html",
+      "waitForXPath": "//div[@id='delayed-target']",
+      "waitForTimeoutMs": 5000 },
+    { "action": "get", "xpath": "//div[@id='delayed-target']", "property": "textContent", "saveAs": "delayed" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log includes <code>Element appeared in file:///…</code> inside the goto block; <code>delayed</code> contains <code>delayed content rendered at HH:MM:SS</code>. Reload the page right before running to see the wait in action.</p>
+      </div>
+      <div class="scenario">
+        <h3>describe — enumerate matches <span class="tag fatal" style="background:#dde;color:#335">read-only</span></h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "describe multi-match group",
+  "tag": "get",
+  "steps": [
+    { "action": "describe", "xpath": "//button[contains(concat(' ', normalize-space(@class), ' '), ' multi-target ')]", "saveAs": "info" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> log shows <code>Described matchCount: 10, first: &lt;button.multi-target&gt; — "Multi 1" → info</code>; <code>info</code> contains JSON with the first 5 matches.</p>
+      </div>
+      <div class="scenario">
+        <h3>Fatal — goto.waitForXPath timeout <span class="tag fatal">fatal</span></h3>
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "fatal: goto waitForXPath timeout",
+  "tag": "action",
+  "steps": [
+    { "action": "goto",
+      "url": "file:///Users/metadesign/Desktop/projects/other/debug-and-automation-wxt/test-fixtures/all-content.html",
+      "waitForXPath": "//div[@id='will-never-exist']",
+      "waitForTimeoutMs": 2000 }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> fatal in ~2s — <code>Locator not found within 2s</code>. The goto fails; subsequent steps don't run.</p>
+      </div>
+    </div>
+    <script>
+      setTimeout(function () {
+        document.getElementById('delayed-host').innerHTML =
+          '<div id="delayed-target">delayed content rendered at ' +
+          new Date().toISOString().slice(11, 19) + '</div>';
+      }, 500);
+      (function () {
+        var host = document.getElementById('multi-target-host');
+        for (var i = 1; i <= 10; i++) {
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'multi-target';
+          b.textContent = 'Multi ' + i;
+          host.appendChild(b);
+        }
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>20. Form: press Enter to submit <span class="tag">press</span></h2>
+    <p class="use-case">Vue forms wired to <code>@keyup.enter</code> on the input, or any form where clicking Submit doesn't fire — only a real keystroke does.</p>
+    <div class="widget">
+      <form id="enter-form">
+        <input id="enter-input" type="text" placeholder="type and press Enter">
+      </form>
+      <p class="result" id="result-enter">not submitted</p>
+    </div>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "press Enter to submit",
+  "tag": "action",
+  "steps": [
+    { "action": "fill",  "xpath": "//input[@id='enter-input']", "value": "form submit" },
+    { "action": "press", "xpath": "//input[@id='enter-input']", "key": "Enter" },
+    { "action": "get",   "xpath": "//p[@id='result-enter']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> result becomes <code>submitted: form submit</code>.</p>
+      </div>
+    </div>
+    <script>
+      document.getElementById('enter-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        document.getElementById('result-enter').textContent =
+          'submitted: ' + document.getElementById('enter-input').value;
+      });
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- ============ REAL-WORLD EXAMPLES (external sites) =================== -->
+  <!-- ===================================================================== -->
+  <section style="background:#fffbe6;border-color:#d6b656">
+    <h2 style="font-size:18px;color:#7a5a00">Real-world examples — external sites <span class="tag" style="background:#f5cf5b;color:#4a3a00">requires internet</span></h2>
+    <p class="use-case" style="color:#5a4500">The scenarios above all target this local fixture page. The four below target live public sites — they're smoke tests against real frameworks (MUI, react-select, Vue, Shepherd) and demonstrate end-to-end flows like "fill a form then verify by reading it back" or "drive a payment widget inside a closed shadow root". They take longer (each does a real <code>goto</code>) and depend on the third-party site staying available.</p>
+  </section>
+
+  <!-- ===== Real example 1: MUI Select ===== -->
+  <section>
+    <h2>R1. MUI Select — pick "Ten" <span class="tag">click (trusted)</span></h2>
+    <p class="use-case">MUI's <code>Select</code> component is one of the most common React UI libraries in business apps. Like react-select, it gates dropdown-open on <code>event.isTrusted</code> — synthetic clicks won't open it. This is the canonical proof that the engine's trusted CDP <code>Input.dispatchMouseEvent</code> path works against a real production MUI build.</p>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "MUI Select: pick Ten (with goto)",
+  "description": "Navigates to the MUI react-select docs page, then picks 'Ten' from the first 'Age' Select. MUI gates dropdown-open on event.isTrusted, so this relies on the engine's CDP Input.dispatchMouseEvent path for the click — no extra flag needed.",
+  "tag": "action",
+  "steps": [
+    { "action": "goto", "url": "https://mui.com/material-ui/react-select/" },
+    { "action": "waitFor", "xpath": "//label[normalize-space(.)='Age']/following::div[@role='combobox'][1]" },
+    { "action": "click",   "xpath": "//label[normalize-space(.)='Age']/following::div[@role='combobox'][1]" },
+    { "action": "waitFor", "xpath": "//ul[@role='listbox']//li[@role='option' and normalize-space(.)='Ten']" },
+    { "action": "click",   "xpath": "//ul[@role='listbox']//li[@role='option' and normalize-space(.)='Ten']" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> navigates to the MUI docs, opens the Age Select, picks Ten. After the run, the demo on the page shows "Ten" as the selected value. Two trusted clicks logged in the panel — the first opens the menu, the second picks the option.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Real example 2: W3Schools tryit iframe form ===== -->
+  <section>
+    <h2>R2. W3Schools tryit — iframe-resident form (fill + verify) <span class="tag">fill + get + variables</span></h2>
+    <p class="use-case">A "form in an iframe" pattern, common across CRM / marketing embed forms (Zoho, HubSpot, Mailchimp, Salesforce Web-to-Lead). W3Schools' "tryit" editor renders demo HTML inside a same-origin iframe (<code>#iframeResult</code>) — the exact same iframe-traversal scenario most CRM embeds need. The engine's <code>deepEval</code> walks into same-origin iframes automatically; no <code>pierceClosed</code> flag required. Demonstrates: <code>{{var}}</code> substitution, multi-field fill, and the read-after-write verification pattern. Public site, no auth required, evergreen.</p>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "W3Schools tryit: fill iframe form (multi-step)",
+  "description": "Navigate to the W3Schools tryit editor for an HTML form sample. The form lives inside #iframeResult (a same-origin iframe). Fills First name + Last name from variables, waits briefly for any settling, then reads First name back to verify nothing was mangled. If W3Schools updates the demo page, field names (fname / lname) may need tweaking.",
+  "tag": "action",
+  "variables": {
+    "firstName": "Md.",
+    "lastName": "Jubair"
+  },
+  "steps": [
+    {
+      "action": "goto",
+      "url": "https://www.w3schools.com/html/tryit.asp?filename=tryhtml_form_submit",
+      "waitForXPath": "//input[@name='fname']"
+    },
+    {
+      "action": "fill",
+      "xpath": "//input[@name='fname']",
+      "value": "{{firstName}}"
+    },
+    {
+      "action": "fill",
+      "xpath": "//input[@name='lname']",
+      "value": "{{lastName}}"
+    },
+    {
+      "action": "wait",
+      "ms": 250
+    },
+    {
+      "action": "get",
+      "xpath": "//input[@name='fname']",
+      "saveAs": "verifiedFirstName"
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> two filled lines in the log (the <code>frame</code> field will be the inner iframe's URL, not the main page), then <code>Got "Md." → verifiedFirstName</code>. The verifiedFirstName output should equal the firstName variable — proves the iframe traversal worked end-to-end. If the form on W3Schools is using different input names (e.g., <code>firstname</code> / <code>lastname</code>), update the xpaths accordingly.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Real example 3: react-select pick Green ===== -->
+  <section>
+    <h2>R3. react-select — pick "Green" with scoping discipline <span class="tag">click + xpath scoping</span></h2>
+    <p class="use-case">react-select.com has multiple <code>&lt;Select&gt;</code> demos on its homepage, and several use <code>defaultMenuIsOpen={true}</code>, which means their <code>select__option</code> elements live in the DOM permanently. A naive <code>//div[select__option and text='Green']</code> xpath would match a phantom Green in an unrelated demo. The fix is to scope the option search to the FIRST <code>select__menu-list</code> — react-select only renders that container while the menu is open, so by the time <code>waitFor</code> sees one, it's the one we just opened. Real-world demonstration of the "scope xpath to the open container" pattern.</p>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "react-select: pick Green (with goto)",
+  "description": "Navigates to react-select.com/home and selects 'Green' from the first demo Select. The page has multiple &lt;Select&gt; instances and several demos use defaultMenuIsOpen, so their option lists live in the DOM permanently. A bare //div[select__option and text='Green'] xpath therefore matches a phantom Green in another demo. Fix: scope the Green search to the FIRST select__menu-list that exists — react-select only renders the menu-list while that select's menu is open, so by the time waitFor sees one, it's the one we just opened. Like MUI, react-select gates the menu-open on event.isTrusted — the engine's trusted CDP click handles this automatically.",
+  "tag": "action",
+  "steps": [
+    {
+      "action": "goto",
+      "url": "https://react-select.com/home"
+    },
+    {
+      "action": "waitFor",
+      "xpath": "(//div[contains(concat(' ', normalize-space(@class), ' '), ' select__control ')])[1]"
+    },
+    {
+      "action": "click",
+      "xpath": "(//div[contains(concat(' ', normalize-space(@class), ' '), ' select__control ')])[1]"
+    },
+    {
+      "action": "waitFor",
+      "xpath": "(//div[contains(concat(' ', normalize-space(@class), ' '), ' select__menu-list ')])[1]"
+    },
+    {
+      "action": "click",
+      "xpath": "(//div[contains(concat(' ', normalize-space(@class), ' '), ' select__menu-list ')])[1]//div[contains(concat(' ', normalize-space(@class), ' '), ' select__option ') and normalize-space(.)='Green']"
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> first Select on the homepage opens, then Green is picked. The demo's displayed value changes to <code>Green</code>. Both clicks logged as <code>(trusted)</code>. If the displayed value stays at the previous selection (often <code>Ocean</code>), the scoping went wrong and the click landed on a phantom option.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Real example 4: Shepherd closed-shadow ===== -->
+  <section>
+    <h2>R4. Shepherd — pay one invoice (closed shadow) <span class="tag">pierceClosed + data-test-id anchoring</span></h2>
+    <p class="use-case">Shepherd renders its UI inside a closed shadow root — invisible to the fast-path <code>document.evaluate</code>. The engine auto-detects closed shadow at attach and routes to CDP, but you can also force it with <code>pierceClosed: true</code> for clarity. This script also demonstrates the <code>data-test-id</code> anchoring pattern: text-based xpath would be fragile against Vue's text-wrapping and framework re-renders, but <code>[@data-test-id='row-0']</code> is stable. Multi-step: fill, wait for the framework to settle, then click. <strong>Requires being logged into the Shepherd app first</strong> — the script doesn't include a goto.</p>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Shepherd: pay one invoice (XPath, multi-step)",
+  "description": "Fills the payment-amount input for the first invoice row, then opens the Payment Type dropdown. All inside the closed shadow root. Uses data-test-id to anchor the row instead of visible text so it survives Vue re-rendering and framework text-wrapping.",
+  "tag": "action",
+  "variables": { "amount": "22" },
+  "steps": [
+    {
+      "action": "fill",
+      "xpath": "//tr[@data-test-id='row-0']//input[@data-test-id='invoice-paymentTable-input']",
+      "value": "{{amount}}",
+      "pierceClosed": true
+    },
+    { "action": "wait", "ms": 200 },
+    {
+      "action": "click",
+      "xpath": "//div[contains(@class, 'react-select-payment__dropdown-indicator')]",
+      "pierceClosed": true
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> the payment-amount input for row-0 fills with <code>22</code>, a brief Vue re-render settles, then the payment-type dropdown opens. Logs include <code>pierceClosed=true — going straight to CDP DOM walk</code>. Pre-req: navigate to the Shepherd invoice page (logged in) before running. If you see "Locator not found", you're probably not on the Take Payment page or not logged in.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Copy-button wiring ===== -->
+  <script>
+    document.addEventListener('click', function (e) {
+      var btn = e.target.closest && e.target.closest('.copy-btn');
+      if (!btn) return;
+      e.preventDefault();
+      var scenario = btn.closest('.scenario');
+      if (!scenario) return;
+      var pre = scenario.querySelector('pre');
+      if (!pre) return;
+      var text = pre.textContent.trim();
+      if (!btn.dataset.copyLabel) {
+        btn.dataset.copyLabel = btn.textContent.trim();
+      }
+
+      function flashCopied() {
+        btn.textContent = '✓ Copied!';
+        btn.classList.add('copied');
+        btn.classList.remove('needs-manual');
+        setTimeout(function () {
+          btn.textContent = btn.dataset.copyLabel;
+          btn.classList.remove('copied');
+        }, 1500);
+      }
+
+      function flashManualShortcut() {
+        var isWin = /Win/i.test(navigator.platform || navigator.userAgent || '');
+        btn.textContent = 'Selected — press ' + (isWin ? 'Ctrl+C' : '⌘C') + ' to copy';
+        btn.classList.remove('copied');
+        btn.classList.add('needs-manual');
+        setTimeout(function () {
+          btn.textContent = btn.dataset.copyLabel;
+          btn.classList.remove('needs-manual');
+        }, 2500);
+      }
+
+      function selectPre() {
+        var range = document.createRange();
+        range.selectNodeContents(pre);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+
+      // Run execCommand synchronously while user gesture is still active.
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0;';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      var execOk = false;
+      try { execOk = document.execCommand('copy'); } catch (err2) {}
+      document.body.removeChild(ta);
+
+      if (execOk) {
+        flashCopied();
+        return;
+      }
+
+      // execCommand failed — try async Clipboard API (called here so it still
+      // captures the user activation at this synchronous call site).
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(flashCopied).catch(function () {
+          selectPre();
+          flashManualShortcut();
+        });
+        return;
+      }
+
+      // Both methods unavailable — select and prompt manual copy.
+      selectPre();
+      flashManualShortcut();
+    });
+  </script>
+</body>
+</html>
