@@ -424,6 +424,90 @@ describe('validator: retry fields (Batch 2)', () => {
   });
 });
 
+describe('validator: waitForResponse (Batch 3)', () => {
+  it('requires urlMatches', () => {
+    expect(() => parseAutomation(`{ "action": "waitForResponse" }`)).toThrow(
+      /waitForResponse requires "urlMatches"/,
+    );
+  });
+
+  it('accepts bare urlMatches', () => {
+    expect(
+      parseAutomation(`{ "action": "waitForResponse", "urlMatches": "/api/" }`).steps,
+    ).toHaveLength(1);
+  });
+
+  it('accepts a full spec — number status, method, saveBody', () => {
+    const out = parseAutomation(`{
+      "action": "waitForResponse",
+      "urlMatches": "/api/save/",
+      "status": 200,
+      "method": "POST",
+      "timeoutMs": 10000,
+      "saveBody": "body",
+      "saveStatus": "code",
+      "saveUrl": "matchedUrl"
+    }`);
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('accepts an array status filter', () => {
+    expect(
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "status": [200, 201, 204] }`,
+      ).steps,
+    ).toHaveLength(1);
+  });
+
+  it('accepts a range status filter', () => {
+    expect(
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "status": { ">=": 200, "<": 300 } }`,
+      ).steps,
+    ).toHaveLength(1);
+  });
+
+  it('rejects status out of HTTP range', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "status": 42 }`,
+      ),
+    ).toThrow(/status must be an integer 100-599/);
+  });
+
+  it('rejects unknown comparison in range status', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "status": { "~": 200 } }`,
+      ),
+    ).toThrow(/unknown comparison "~"/);
+  });
+
+  it('rejects unknown HTTP method', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "method": "JUMP" }`,
+      ),
+    ).toThrow(/method must be one of/);
+  });
+
+  it('rejects non-string saveBody', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "saveBody": true }`,
+      ),
+    ).toThrow(/saveBody must be a string/);
+  });
+
+  it('inherits retry fields', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "waitForResponse", "urlMatches": "/x", "retries": 99 }`,
+      ),
+    ).toThrow(/retries capped at 5/);
+  });
+});
+
 describe('registry consistency: stepValidators vs actions/index.ts', () => {
   it('every registered action has a validator', () => {
     for (const name of Object.keys(actions)) {

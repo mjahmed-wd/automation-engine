@@ -35,7 +35,8 @@ import {
   type GetOptions,
   type Mode,
 } from './locator';
-import { parseUrlMatcher, waitForNewTabMatching, waitForTabComplete } from './tabs';
+import { parseUrlMatcher, waitForTabComplete } from './tabs';
+import { EventWaiter } from './event-waiter';
 
 type Target = chrome.debugger.Debuggee;
 
@@ -60,6 +61,38 @@ interface TabAttachment {
    * because a `dialog` arming on tab A shouldn't fire for tab B's confirm.
    */
   nextDialogResponse: { accept: boolean; promptText: string } | null;
+  /**
+   * Buffer of recent Network.responseReceived events for this tab. Populated
+   * by the Page's CDP event router; consumed by `waitForResponse`. Per-tab
+   * because closing one tab shouldn't affect another tab's pending response
+   * waits, and event volumes can be high enough that mixing tabs would
+   * make matching ambiguous.
+   */
+  networkWaiter: EventWaiter<NetworkResponse>;
+  /**
+   * Bookkeeping for `Network.responseReceived` — the event params don't
+   * include the HTTP method, so we track it via the earlier
+   * `Network.requestWillBeSent` keyed by `requestId`. Pruned periodically
+   * to avoid growing unbounded for long sessions with many XHRs.
+   */
+  requestMethodById: Map<string, { method: string; at: number }>;
+}
+
+/**
+ * Normalised shape of a network response event, surfaced to the
+ * `waitForResponse` action handler.
+ */
+export interface NetworkResponse {
+  requestId: string;
+  url: string;
+  status: number;
+  /** HTTP method (uppercase), reconstructed from the prior
+   *  `Network.requestWillBeSent`. Empty string if we missed the request
+   *  event (rare; happens for tabs the engine attached to mid-fetch). */
+  method: string;
+  /** Whether the response body has been read out via DOM body fetch.
+   *  Not populated until `Network.getResponseBody` resolves. */
+  bodyRead?: boolean;
 }
 
 export interface FrameResult {
@@ -183,6 +216,23 @@ export class Page {
     method: string,
     params?: any,
   ) => void;
+  /**
+   * Always-on `chrome.tabs.onCreated` / `onUpdated` listeners populate this
+   * waiter at Page lifetime. `waitForNewTab` consumes from it, which means
+   * events that fired BEFORE the await began still resolve (race-tolerant
+   * via the ringbuffer). Replaces the on-demand listener pattern that lived
+   * in tabs.ts before Batch 3.
+   */
+  private readonly tabEventWaiter = new EventWaiter<chrome.tabs.Tab>({
+    windowMs: 30_000,
+    maxBufferSize: 50,
+  });
+  private tabCreatedListener?: (tab: chrome.tabs.Tab) => void;
+  private tabUpdatedListener?: (
+    tabId: number,
+    info: chrome.tabs.TabChangeInfo,
+    tab: chrome.tabs.Tab,
+  ) => void;
   private detached = false;
 
   /** Public view of the active tab. Getter (not field) because it changes
@@ -260,6 +310,22 @@ export class Page {
     };
     chrome.debugger.onEvent.addListener(this.listener);
 
+    // Always-on chrome.tabs listeners — populate the tabEventWaiter so that
+    // `waitForNewTab` is race-tolerant. The waiter's ringbuffer holds the
+    // last 30s of tab events, so a tab opened synchronously inside the
+    // prior step's window.open call still resolves the await.
+    this.tabCreatedListener = (tab) => {
+      this.tabEventWaiter.emit(tab);
+    };
+    this.tabUpdatedListener = (_tabId, _info, tab) => {
+      // We re-emit on every onUpdated too — URL transitions (about:blank →
+      // real URL) are common right after onCreated, and the predicate
+      // typically gates on URL.
+      this.tabEventWaiter.emit(tab);
+    };
+    chrome.tabs.onCreated.addListener(this.tabCreatedListener);
+    chrome.tabs.onUpdated.addListener(this.tabUpdatedListener);
+
     await this.attachTab(this.currentTabId);
   }
 
@@ -285,6 +351,11 @@ export class Page {
       cdpReadyChildren: new Set(),
       hasClosedShadow: false,
       nextDialogResponse: null,
+      networkWaiter: new EventWaiter<NetworkResponse>({
+        windowMs: 30_000,
+        maxBufferSize: 200, // network event volume can be higher than tab events
+      }),
+      requestMethodById: new Map(),
     };
     // Register BEFORE attaching so the event listener can route any events
     // that fire during attach (Target.attachedToTarget for pre-existing
@@ -301,6 +372,13 @@ export class Page {
       // Page.enable, native alert()/confirm()/prompt() would block the page
       // indefinitely and stall the run loop.
       await this.sendCmd(target, 'Page.enable').catch(() => {});
+      // Network domain — backs the `waitForResponse` action (Batch 3).
+      // Caveat: enabling Network disables Chrome's disk cache for the
+      // attached debugger session. Real impact: cold-load asset fetches
+      // are slower while the engine is attached. Fine for automation, but
+      // worth knowing if a script behaves differently with vs without the
+      // engine attached.
+      await this.sendCmd(target, 'Network.enable').catch(() => {});
       await this.sendCmd(target, 'Target.setAutoAttach', {
         autoAttach: true,
         waitForDebuggerOnStart: false,
@@ -400,6 +478,42 @@ export class Page {
         if (msg.error) slot.reject(new Error(msg.error.message ?? `code ${msg.error.code}`));
         else slot.resolve(msg.result);
       }
+    } else if (method === 'Network.requestWillBeSent') {
+      // Method tracking — the responseReceived event doesn't include the
+      // HTTP method, so we record it from requestWillBeSent keyed by
+      // requestId, then look it up when the response arrives. We prune
+      // entries older than 60s during emit to bound memory for long
+      // sessions with many XHRs.
+      const reqId: string | undefined = params?.requestId;
+      const reqMethod: string | undefined = params?.request?.method;
+      if (reqId && reqMethod) {
+        attachment.requestMethodById.set(reqId, {
+          method: String(reqMethod).toUpperCase(),
+          at: Date.now(),
+        });
+        // Opportunistic prune on every insert. Cheap O(map size); rare
+        // path. Cutoff is generous to handle slow servers without losing
+        // the method for the eventual response.
+        const cutoff = Date.now() - 60_000;
+        if (attachment.requestMethodById.size > 200) {
+          for (const [id, entry] of attachment.requestMethodById) {
+            if (entry.at < cutoff) attachment.requestMethodById.delete(id);
+          }
+        }
+      }
+    } else if (method === 'Network.responseReceived') {
+      const reqId: string | undefined = params?.requestId;
+      const response = params?.response;
+      if (!reqId || !response) return;
+      const methodEntry = attachment.requestMethodById.get(reqId);
+      // Consume the method-tracking entry — won't be needed again.
+      attachment.requestMethodById.delete(reqId);
+      attachment.networkWaiter.emit({
+        requestId: reqId,
+        url: String(response.url ?? ''),
+        status: Number(response.status ?? 0),
+        method: methodEntry?.method ?? '',
+      });
     }
   }
 
@@ -407,10 +521,24 @@ export class Page {
     if (this.detached) return;
     this.detached = true;
     if (this.listener) chrome.debugger.onEvent.removeListener(this.listener);
+    if (this.tabCreatedListener) {
+      chrome.tabs.onCreated.removeListener(this.tabCreatedListener);
+    }
+    if (this.tabUpdatedListener) {
+      chrome.tabs.onUpdated.removeListener(this.tabUpdatedListener);
+    }
+    // Cancel any pending awaits so callers don't hang. Per-attachment
+    // network waiters get cleared in their own teardown loop below.
+    this.tabEventWaiter.clear('Page detached');
 
     // Detach every tab we attached during this run. Order doesn't matter —
     // each detach is independent. We catch & log per-tab so one bad tab
     // (e.g., already closed) doesn't prevent the others from cleaning up.
+    // Reject any pending per-tab network waits before we tear down the
+    // sessions — otherwise their callers hang until their own timeouts.
+    for (const att of this.attachments.values()) {
+      att.networkWaiter.clear('Page detached');
+    }
     const targets = [...this.attachments.values()].map((a) => a.target);
     this.attachments.clear();
     for (const target of targets) {
@@ -652,42 +780,31 @@ export class Page {
     opts: { urlMatches?: string; timeoutMs?: number } = {},
   ): Promise<number> {
     const timeoutMs = opts.timeoutMs ?? 10_000;
+    const matcher = parseUrlMatcher(opts.urlMatches);
 
-    // Race-tolerant pre-check. The page's onclick handler may have called
-    // window.open SYNCHRONOUSLY inside the prior `click` step, which means
-    // chrome.tabs.onCreated has already fired by the time we get here. The
-    // listener-based wait would then sit idle forever — there's no future
-    // onCreated to receive. Query for any matching tab that isn't already
-    // attached, treat that as the new tab if found.
-    //
-    // Safety: we exclude `this.currentTabId` and anything in
-    // `this.attachments` (tabs the engine itself opened or is driving). A
-    // pre-existing unrelated tab whose URL coincidentally matches the
-    // pattern would still be caught — keep urlMatches specific in scripts.
-    if (opts.urlMatches) {
-      const matcher = parseUrlMatcher(opts.urlMatches);
-      const existing = await chrome.tabs.query({});
-      for (const t of existing) {
-        if (t.id === undefined) continue;
-        if (t.id === this.currentTabId) continue;
-        if (this.attachments.has(t.id)) continue;
-        const url = t.url ?? t.pendingUrl ?? '';
-        if (url && matcher(url)) {
-          this.log(
-            'info',
-            `Found matching tab ${t.id} already open (race with prior step); attaching.`,
-          );
-          this.originStack.push(this.currentTabId);
-          await chrome.tabs.update(t.id, { active: true }).catch(() => {});
-          await waitForTabComplete(t.id, 30_000);
-          await this.attachTab(t.id);
-          return t.id;
-        }
-      }
+    // Predicate: tab not already attached, not the current tab, and URL
+    // (or pendingUrl) matches. The waiter's ringbuffer scans recent events
+    // first, so a tab opened synchronously inside the prior step still
+    // resolves the await — no separate race-tolerant pre-check needed.
+    const predicate = (tab: chrome.tabs.Tab): boolean => {
+      if (tab.id === undefined) return false;
+      if (tab.id === this.currentTabId) return false;
+      if (this.attachments.has(tab.id)) return false;
+      const url = tab.url ?? tab.pendingUrl ?? '';
+      if (!url) return false;
+      return matcher(url);
+    };
+
+    const matched = await this.tabEventWaiter.await(
+      predicate,
+      timeoutMs,
+      `new tab${opts.urlMatches ? ` matching '${opts.urlMatches}'` : ''}`,
+    );
+    if (matched.id === undefined) {
+      throw new Error('waitForNewTab: matched tab has no id (unexpected).');
     }
+    const id = matched.id;
 
-    // No pre-existing match — set up the listener-based wait.
-    const id = await waitForNewTabMatching(this.windowId, opts.urlMatches, timeoutMs);
     this.originStack.push(this.currentTabId);
     await chrome.tabs.update(id, { active: true }).catch(() => {});
     await waitForTabComplete(id, 30_000);
@@ -749,6 +866,80 @@ export class Page {
       this.currentTabId = fallback;
       await chrome.tabs.update(fallback, { active: true }).catch(() => {});
       this.log('info', `Closed tab ${closingId}; fell back to tab ${fallback}.`);
+    }
+  }
+
+  // ---------- network waits (Batch 3) ----------
+
+  /**
+   * Wait for the next Network.responseReceived event on the current tab
+   * matching the supplied predicates. Race-tolerant via the per-tab
+   * EventWaiter ringbuffer — responses that fired up to ~30s ago still
+   * resolve (handles the common case where the response lands DURING the
+   * prior step's CDP roundtrip).
+   *
+   * `saveBody: true` triggers an extra `Network.getResponseBody` CDP call
+   * after the event arrives, returning the body as a string (base64
+   * decoded if the response was binary). Omit to skip — the network wait
+   * itself is event-only and very cheap.
+   */
+  async waitForResponse(opts: {
+    urlMatches: string;
+    status?: number | number[] | Record<string, number>;
+    method?: string;
+    timeoutMs?: number;
+    saveBody?: boolean;
+  }): Promise<NetworkResponse & { body?: string }> {
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    const urlPred = parseUrlMatcher(opts.urlMatches);
+    const statusPred = buildStatusPredicate(opts.status);
+    const methodPred = opts.method
+      ? (m: string) => m === String(opts.method).toUpperCase()
+      : () => true;
+
+    const predicate = (r: NetworkResponse): boolean =>
+      urlPred(r.url) && statusPred(r.status) && methodPred(r.method);
+
+    const matched = await this.attachment.networkWaiter.await(
+      predicate,
+      timeoutMs,
+      describeResponseFilter(opts),
+    );
+
+    let body: string | undefined;
+    if (opts.saveBody) {
+      body = await this.fetchResponseBody(matched.requestId);
+    }
+    return { ...matched, body };
+  }
+
+  /**
+   * Read the body of a previously-received response via
+   * `Network.getResponseBody`. Decodes base64 transparently so callers
+   * always get a string. Returns empty string if the body is unavailable
+   * (Chrome discards bodies for some redirect chains and image fetches).
+   */
+  private async fetchResponseBody(requestId: string): Promise<string> {
+    try {
+      const res = await this.sendCmd<any>(this.tabTarget, 'Network.getResponseBody', {
+        requestId,
+      });
+      const body = String(res?.body ?? '');
+      if (res?.base64Encoded) {
+        try {
+          // atob is available in service workers and browser contexts.
+          return atob(body);
+        } catch {
+          return body; // give up gracefully — return raw base64
+        }
+      }
+      return body;
+    } catch (err: any) {
+      this.log(
+        'info',
+        `getResponseBody for ${requestId} failed: ${err?.message ?? err}. Returning empty string.`,
+      );
+      return '';
     }
   }
 
@@ -2191,6 +2382,67 @@ function isAbsoluteFilePath(p: string): boolean {
   if (/^[A-Za-z]:[\\/]/.test(p)) return true;
   if (p.startsWith('\\\\')) return true;
   return false;
+}
+
+/**
+ * Build a predicate from a status filter. Three accepted forms:
+ *   - undefined        → accept any status
+ *   - number           → exact match (e.g., 200)
+ *   - number[]         → any-of (e.g., [200, 201, 204])
+ *   - range object     → keyed by '>=', '>', '<=', '<', '==' (e.g., {">=":200,"<":300})
+ *
+ * The validator already rejects malformed inputs at parse time; this helper
+ * trusts its caller to pass a shape that's already been validated.
+ */
+function buildStatusPredicate(
+  filter: number | number[] | Record<string, number> | undefined,
+): (status: number) => boolean {
+  if (filter === undefined) return () => true;
+  if (typeof filter === 'number') {
+    return (s) => s === filter;
+  }
+  if (Array.isArray(filter)) {
+    const set = new Set(filter);
+    return (s) => set.has(s);
+  }
+  // Range form: AND of comparisons.
+  const checks: Array<(s: number) => boolean> = [];
+  for (const [op, value] of Object.entries(filter)) {
+    switch (op) {
+      case '>=': checks.push((s) => s >= value); break;
+      case '>':  checks.push((s) => s >  value); break;
+      case '<=': checks.push((s) => s <= value); break;
+      case '<':  checks.push((s) => s <  value); break;
+      case '==': checks.push((s) => s === value); break;
+      // Validator should have caught unknown ops; fall through silently.
+    }
+  }
+  return (s) => checks.every((c) => c(s));
+}
+
+/**
+ * Build a human-readable label of what we're filtering on. Used as the
+ * `errLabel` argument to `EventWaiter.await` so timeout messages say
+ * exactly which response we were waiting for.
+ */
+function describeResponseFilter(opts: {
+  urlMatches: string;
+  status?: number | number[] | Record<string, number>;
+  method?: string;
+}): string {
+  const bits: string[] = [`URL matching '${opts.urlMatches}'`];
+  if (opts.status !== undefined) {
+    if (typeof opts.status === 'number') {
+      bits.push(`status ${opts.status}`);
+    } else if (Array.isArray(opts.status)) {
+      bits.push(`status in [${opts.status.join(', ')}]`);
+    } else {
+      const parts = Object.entries(opts.status).map(([op, v]) => `${op}${v}`);
+      bits.push(`status ${parts.join(' & ')}`);
+    }
+  }
+  if (opts.method) bits.push(`method ${opts.method.toUpperCase()}`);
+  return `network response (${bits.join(', ')})`;
 }
 
 /**

@@ -9,5 +9,4 @@ export {
   isAttachable,
   waitForTabComplete,
   parseUrlMatcher,
-  waitForNewTabMatching,
 } from '@/src/automation/tabs';

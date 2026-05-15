@@ -21,6 +21,7 @@ import { hoverAction } from './hover';
 import { dialogAction } from './dialog';
 import { describeAction } from './describe';
 import { tabAction } from './tab';
+import { waitForResponseAction } from './waitForResponse';
 
 export type ActionHandler = (
   step: any,
@@ -43,6 +44,7 @@ export const actions: Record<AutomationStep['action'], ActionHandler> = {
   dialog: dialogAction,
   describe: describeAction,
   tab: tabAction,
+  waitForResponse: waitForResponseAction,
 };
 
 export function resolveAction(name: string): ActionHandler | undefined {

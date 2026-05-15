@@ -4,9 +4,18 @@
  * state, no debugger surface, just `chrome.tabs` wrappers.
  *
  * Lives in `src/automation/` rather than `entrypoints/background/` because
- * `Page` (in this folder) needs `parseUrlMatcher` + `waitForNewTabMatching`
- * for the multi-tab feature, and importing across the folder boundary the
- * other direction would invert our layering.
+ * `Page` (in this folder) needs these helpers for the multi-tab feature, and
+ * importing across the folder boundary the other direction would invert our
+ * layering.
+ *
+ * NOTE: the standalone `waitForNewTabMatching` helper that used to live here
+ * was removed in Batch 3. Its job is now done by an always-on `EventWaiter`
+ * inside `Page` that's populated by `chrome.tabs.onCreated` + `onUpdated`
+ * listeners registered at `Page.init` time. See `Page.waitForNewTab` and
+ * `event-waiter.ts`. The on-demand listener pattern that used to live here
+ * had a race window: `chrome.tabs.onCreated` could fire BEFORE the listener
+ * attached if the prior step's `window.open` ran synchronously inside its
+ * click handler. EventWaiter's ringbuffer closes that window cleanly.
  */
 
 /** Browser-internal URLs that chrome.debugger.attach() refuses to touch. */
@@ -89,94 +98,12 @@ export function waitForTabComplete(tabId: number, timeoutMs: number): Promise<vo
         });
     }, 250);
 
-    // Immediate check, same as before — fast path for already-complete tabs.
+    // Immediate check — fast path for already-complete tabs.
     chrome.tabs
       .get(tabId)
       .then((t) => {
         if (t.status === 'complete') finish();
       })
       .catch(() => {});
-  });
-}
-
-/**
- * Wait for a new tab to open in the given window whose URL matches `pattern`.
- *
- * Why both onCreated AND onUpdated: `chrome.tabs.onCreated` fires immediately
- * with `tab.url === ''` (or `'about:blank'`) and the real URL arrives later
- * via `chrome.tabs.onUpdated`. Matching on `onCreated` alone would miss the
- * real URL; matching on `onUpdated` alone would race for tabs that finish
- * loading before our listener attaches. We watch onCreated to learn the new
- * tab's id, then onUpdated to learn its URL.
- *
- * `windowId` is treated as a preference, not a hard filter. New tabs from the
- * same window are always candidates; tabs from OTHER windows are also added
- * because `window.open(_, '_blank')` on file:// origins commonly lands the
- * popup in a fresh Chrome window. Without this relaxation a strict windowId
- * gate would silently never resolve — the right tab would exist but be
- * invisible. URL matching is the real filter; window membership is
- * informational (logged but not enforced).
- *
- * Listeners cleanup on resolve / reject / timeout.
- */
-export function waitForNewTabMatching(
-  windowId: number | undefined,
-  pattern: string | undefined,
-  timeoutMs: number,
-): Promise<number> {
-  const matches = parseUrlMatcher(pattern);
-  return new Promise<number>((resolve, reject) => {
-    const candidates = new Set<number>();
-
-    const cleanup = () => {
-      clearTimeout(timer);
-      chrome.tabs.onCreated.removeListener(onCreated);
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-    };
-
-    const onCreated = (tab: chrome.tabs.Tab) => {
-      if (tab.id === undefined) return;
-      // Accept tabs from any window — popup window placement is unpredictable
-      // and the URL match is what really gates resolution. Track windowId
-      // mismatch for logs only; don't reject the tab.
-      if (windowId !== undefined && tab.windowId !== windowId) {
-        // Different-window candidate: still a valid match if URL fits.
-      }
-      candidates.add(tab.id);
-      // Some pages set the URL synchronously enough that the initial Tab has
-      // it. If so, take the shortcut.
-      const url = tab.pendingUrl ?? tab.url ?? '';
-      if (url && matches(url)) {
-        cleanup();
-        resolve(tab.id);
-      }
-    };
-
-    const onUpdated = (
-      tabId: number,
-      _info: chrome.tabs.TabChangeInfo,
-      tab: chrome.tabs.Tab,
-    ) => {
-      if (!candidates.has(tabId)) return;
-      const url = tab.url ?? tab.pendingUrl ?? '';
-      if (!url) return;
-      if (matches(url)) {
-        cleanup();
-        resolve(tabId);
-      }
-    };
-
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(
-        new Error(
-          `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for new tab` +
-            (pattern ? ` matching '${pattern}'` : ''),
-        ),
-      );
-    }, timeoutMs);
-
-    chrome.tabs.onCreated.addListener(onCreated);
-    chrome.tabs.onUpdated.addListener(onUpdated);
   });
 }

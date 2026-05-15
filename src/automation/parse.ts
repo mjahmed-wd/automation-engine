@@ -285,6 +285,59 @@ export const stepValidators: Record<string, StepValidator> = {
 
     return validateRetryFields(s, n);
   },
+  waitForResponse: (s, n) => {
+    if (!isString(s.urlMatches))
+      return `Step ${n}: waitForResponse requires "urlMatches" (string).`;
+
+    // Status filter — accept three shapes: number, number[], range object.
+    if (s.status !== undefined) {
+      if (typeof s.status === 'number') {
+        if (
+          !Number.isInteger(s.status) ||
+          s.status < 100 ||
+          s.status > 599
+        )
+          return `Step ${n}: waitForResponse.status must be an integer 100-599.`;
+      } else if (Array.isArray(s.status)) {
+        if (s.status.length === 0)
+          return `Step ${n}: waitForResponse.status array must not be empty.`;
+        for (const v of s.status) {
+          if (!Number.isInteger(v) || v < 100 || v > 599)
+            return `Step ${n}: waitForResponse.status[] entries must be integers 100-599.`;
+        }
+      } else if (typeof s.status === 'object' && s.status !== null) {
+        const allowed = ['>=', '>', '<=', '<', '=='];
+        const keys = Object.keys(s.status);
+        if (keys.length === 0)
+          return `Step ${n}: waitForResponse.status range object must have at least one comparison.`;
+        for (const k of keys) {
+          if (!allowed.includes(k))
+            return `Step ${n}: waitForResponse.status: unknown comparison "${k}". Use one of ${allowed.join(', ')}.`;
+          const v = (s.status as Record<string, unknown>)[k];
+          if (!Number.isInteger(v as number) || (v as number) < 100 || (v as number) > 599)
+            return `Step ${n}: waitForResponse.status.${k} must be an integer 100-599.`;
+        }
+      } else {
+        return `Step ${n}: waitForResponse.status must be a number, array of numbers, or range object.`;
+      }
+    }
+
+    if (s.method !== undefined) {
+      const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+      if (!isString(s.method) || !METHODS.includes(s.method.toUpperCase()))
+        return `Step ${n}: waitForResponse.method must be one of ${METHODS.join(', ')}.`;
+    }
+
+    if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
+      return `Step ${n}: waitForResponse.timeoutMs must be a number.`;
+
+    for (const k of ['saveBody', 'saveStatus', 'saveUrl'] as const) {
+      if (s[k] !== undefined && !isString(s[k]))
+        return `Step ${n}: waitForResponse.${k} must be a string.`;
+    }
+
+    return validateRetryFields(s, n);
+  },
 };
 
 function validateScript(script: AutomationScript): void {
