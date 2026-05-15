@@ -121,6 +121,57 @@ test.describe('multi-tab orchestration', () => {
     expect(await logContains(sidePanel, 'Closed tab')).toBe(true);
   });
 
+  test('openWindow: popup window lands in a different windowId; close returns to origin', async ({
+    context,
+    sidePanel,
+  }) => {
+    test.setTimeout(60_000);
+
+    const fixture = await context.newPage();
+    await fixture.goto(FIXTURE_URL);
+    await fixture.locator('#open-detail-link').waitFor();
+
+    // Capture the source tab's windowId via the CDP session. Playwright
+    // doesn't expose chrome.tabs IDs directly, so we read the window count
+    // before and after as a coarse cross-window assertion (popup opening a
+    // new window bumps context.pages().length by 1; closing returns it).
+    const baselinePages = context.pages().length;
+
+    const script = {
+      name: 'multi-tab: openWindow popup',
+      tag: 'action',
+      steps: [
+        {
+          action: 'tab',
+          op: 'openWindow',
+          url: `${FIXTURE_URL}#detail`,
+          windowType: 'popup',
+          width: 600,
+          height: 400,
+          waitForXPath: "//input[@id='detail-input']",
+        },
+        { action: 'fill', xpath: "//input[@id='detail-input']", value: 'popup-value' },
+        {
+          action: 'get',
+          xpath: "//input[@id='detail-input']",
+          property: 'value',
+          saveAs: 'v',
+        },
+        { action: 'tab', op: 'close' },
+      ],
+    };
+
+    await pasteAndRun(sidePanel, fixture, script);
+    await waitForLog(sidePanel, 'Finished', 45_000);
+
+    // Popup window closed → back to baseline page count.
+    expect(context.pages().length).toBe(baselinePages);
+
+    // Log evidence: the engine reported opening a popup window AND closing it.
+    expect(await logContains(sidePanel, 'Opened new popup window')).toBe(true);
+    expect(await logContains(sidePanel, 'Closed tab')).toBe(true);
+  });
+
   test('negative: tab waitForNew times out cleanly on non-matching pattern', async ({
     context,
     sidePanel,

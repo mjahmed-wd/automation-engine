@@ -65,7 +65,7 @@ Open any site (e.g., `example.com`), then paste this into the side panel:
 
 The log shows `Got "Example Domain" → title`, and the saved output renders below the editor.
 
-For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **22 fixture sections + 4 real-world examples** covering every action and every locator path.
+For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **22 fixture sections + 6 real-world examples** covering every action and every locator path.
 
 ---
 
@@ -252,11 +252,14 @@ The arming is one-shot — subsequent dialogs revert to auto-accept.
 
 #### `tab`
 
-Multi-tab orchestration. Six ops: `open` (engine-initiated new tab), `switchTo` (focus an existing tab by URL or index), `waitForNew` (wait for a tab opened by a page-side side effect like a `target="_blank"` link), `close` (close current and pop the origin stack), `next` / `previous` (cycle within the window).
+Multi-tab + multi-window orchestration. Seven ops: `open` (engine-initiated new tab in current window), `openWindow` (engine-initiated new browser window, optionally sized popup), `switchTo` (focus an existing tab by URL or index), `waitForNew` (wait for a tab opened by a page-side side effect like a `target="_blank"` link), `close` (close current and pop the origin stack), `next` / `previous` (cycle within the window).
 
 ```jsonc
 { "action": "tab", "op": "open", "url": "https://lookup.internal/sku/{{sku}}",
   "waitForXPath": "//span[@id='price']" }
+{ "action": "tab", "op": "openWindow", "url": "https://en.wikipedia.org/wiki/Foo",
+  "windowType": "popup", "width": 700, "height": 500,
+  "waitForXPath": "//h1[@id='firstHeading']" }
 { "action": "tab", "op": "waitForNew", "urlMatches": "/customers/", "timeoutMs": 10000 }
 { "action": "tab", "op": "switchTo", "urlMatches": "/\\/invoices\\/edit/" }
 { "action": "tab", "op": "close" }
@@ -361,19 +364,82 @@ After `tab close`, the engine reactivates the tab it switched from. No explicit 
 
 ### Script-triggered: open a side tab for a lookup
 
-The script proactively opens a side tab to a reference page, reads a value, closes, returns:
+The script proactively opens a side tab to a reference page, reads a value, closes, returns. Real public-site demo using DuckDuckGo (the form page) and Wikipedia (the lookup target) — both stable, no auth required, evergreen:
 
 ```jsonc
-[
-  { "action": "tab",  "op": "open", "url": "https://lookup.internal/sku/{{sku}}",
-    "waitForXPath": "//span[@id='price']" },
-  { "action": "get",  "xpath": "//span[@id='price']", "saveAs": "price" },
-  { "action": "tab",  "op": "close" },
-  { "action": "fill", "xpath": "//input[@name='quoted_price']", "value": "{{price}}" }
-]
+{
+  "name": "Cross-site lookup via new tab",
+  "variables": {
+    "wikipediaUrl": "https://en.wikipedia.org/wiki/Chrome_DevTools_Protocol"
+  },
+  "steps": [
+    { "action": "goto", "url": "https://duckduckgo.com",
+      "waitForXPath": "//input[@name='q']" },
+
+    { "action": "tab", "op": "open",
+      "url": "{{wikipediaUrl}}",
+      "waitForXPath": "//h1[@id='firstHeading']" },
+
+    { "action": "get",
+      "xpath": "//h1[@id='firstHeading']",
+      "property": "textContent",
+      "saveAs": "title" },
+
+    { "action": "wait", "ms": 3000 },
+    { "action": "tab", "op": "close" },
+
+    { "action": "fill",
+      "xpath": "//input[@name='q']",
+      "value": "{{title}}" }
+  ]
+}
 ```
 
+What happens: DuckDuckGo loads, then a new tab opens at the Wikipedia article and Chrome focuses it. After `waitForXPath` blocks on the article heading, the script reads `"Chrome DevTools Protocol"` into `title`, pauses 3s, closes the Wikipedia tab, and Chrome focuses back on DuckDuckGo. The search box gets filled with the article title.
+
 `tab open` goes through `chrome.tabs.create` via the extension's `tabs` permission, so it's not subject to the page's popup blocker — works on `file://` origins too. Prefer this over page-triggered when the script knows the URL it wants.
+
+### Script-triggered: open a sized popup window
+
+Same flow as above, but the lookup lands in a separate Chrome window — useful for OAuth-style consent popups, second-monitor workflows, or when you want the lookup visually separated. Identical use case to the "new tab" example above; only the open step changes:
+
+```jsonc
+{
+  "name": "Cross-site lookup via popup window",
+  "variables": {
+    "wikipediaUrl": "https://en.wikipedia.org/wiki/Chrome_DevTools_Protocol"
+  },
+  "steps": [
+    { "action": "goto", "url": "https://duckduckgo.com",
+      "waitForXPath": "//input[@name='q']" },
+
+    { "action": "tab", "op": "openWindow",
+      "url": "{{wikipediaUrl}}",
+      "windowType": "popup",
+      "width": 700,
+      "height": 500,
+      "waitForXPath": "//h1[@id='firstHeading']" },
+
+    { "action": "get",
+      "xpath": "//h1[@id='firstHeading']",
+      "property": "textContent",
+      "saveAs": "title" },
+
+    { "action": "wait", "ms": 3000 },
+    { "action": "tab", "op": "close" },
+
+    { "action": "fill",
+      "xpath": "//input[@name='q']",
+      "value": "{{title}}" }
+  ]
+}
+```
+
+What's different vs. the new-tab version: a 700×500 popup window pops up at the Wikipedia URL (minimal chrome — no tabs, no address bar), the script drives it the same way, and when `tab close` runs the popup window auto-closes (because its only tab is closing). Focus returns to the original Chrome window where DuckDuckGo is loaded.
+
+`windowType: 'popup'` produces a minimal window. Omit it or pass `'normal'` for a regular Chrome window with full chrome. `width` / `height` / `left` / `top` are optional — Chrome picks defaults when omitted. Closing the only tab in the popup window auto-closes the window via Chrome's default behavior; no separate close-window op is needed.
+
+`openWindow` is an extension-side API call (`chrome.windows.create`), not subject to the page's popup blocker. Works for any URL the extension can navigate to.
 
 ### `urlMatches` patterns
 
@@ -518,7 +584,7 @@ src/automation/
     ├── hover.ts
     ├── dialog.ts
     ├── describe.ts
-    └── tab.ts             Multi-tab orchestration (open / switchTo / waitForNew / close / next / previous)
+    └── tab.ts             Multi-tab + multi-window orchestration (open / openWindow / switchTo / waitForNew / close / next / previous)
 
 entrypoints/
 ├── background/            Service worker — message dispatcher + automation runner
@@ -536,9 +602,9 @@ automations/               Local script library — gitignored except .gitkeep
                            import.meta.glob picks up every *.json at build time
 
 test-fixtures/
-└── all-content.html       Self-documenting fixture: 22 sections (21 happy-path + 1 closed-shadow + script-injection cookbook)
-                           + 4 real-world examples (MUI, react-select, W3Schools, Shepherd). Doubles as
-                           the smoke-automation target.
+└── all-content.html       Self-documenting fixture: 22 sections (every action + multi-tab + script-injection)
+                           + 6 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo
+                           new-tab, Wikipedia/DuckDuckGo popup-window). Doubles as the smoke-automation target.
 
 e2e/                       Playwright suite
 ├── fixtures/extension.ts  Persistent-context fixture loading the built extension
@@ -582,7 +648,7 @@ npm test           # one-shot
 npm run test:watch # watch mode
 ```
 
-65 tests, runs in under 2 seconds. No browser, no extension load.
+71 tests, runs in under 2 seconds. No browser, no extension load.
 
 ### E2E tests (Playwright)
 
@@ -594,7 +660,7 @@ npm run test:e2e                  # builds extension first, then runs suite
 npm run test:e2e:ui               # interactive UI
 ```
 
-7 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 3 multi-tab cases (page-triggered, script-triggered, negative timeout). Runs in ~3-4 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
+8 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 4 multi-tab cases (page-triggered, script-triggered, openWindow popup, negative timeout). Runs in ~3-4 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
 
 Three E2E-specific shims live in the test setup; touch them only if you understand the comments first:
 
@@ -610,7 +676,7 @@ Three E2E-specific shims live in the test setup; touch them only if you understa
 2. Run `phase4-fixture-smoke.json` from the dropdown (lives in your `automations/` folder).
 3. Watch the panel log: every action should report green, every result paragraph in the fixture should reflect the expected outcome.
 
-The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 22 sections (every action plus the multi-tab and script-injection cookbooks) plus 4 real-world examples (MUI, react-select, W3Schools, Shepherd).
+The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 22 sections (every action plus the multi-tab and script-injection cookbooks) plus 6 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo new-tab, Wikipedia/DuckDuckGo popup-window).
 
 ---
 
@@ -641,10 +707,10 @@ Mapping commit history to milestones:
 - **Phase 3** — Frame & navigation hardening: `goto.waitForXPath` for SPA-aware navigation, native dialog handling (`Page.enable` + `Page.handleJavaScriptDialog`).
 - **Phase 4** — DX & error reporting: structured error messages, `describe` action, parse-time JSON validation, Vitest unit suite, Playwright E2E suite, mega-fixture cookbook (`all-content.html`), background folder refactor, this README.
 - **Phase 5 Batch 1** — Multi-tab orchestration: `tab` action (open / switchTo / waitForNew / close / next / previous), `Page` class restructured around a per-tab `TabAttachment` map so revisiting a tab is a pointer flip not a re-attach, origin stack for `close` to pop back, `windowId` threading, fixture section 21 + 22 (multi-tab + script injection), three new E2E specs.
+- **Phase 5 Batch 1.5** — Multi-window extension: `op: 'openWindow'` on the `tab` step, backed by `chrome.windows.create`. Supports `windowType: 'normal' | 'popup'` plus optional `width` / `height` / `left` / `top`. Reuses Batch 1's origin stack so `close` pops back to the source tab in the source window. `openTab` patched to use the current tab's `windowId` (not the engine's primary) so opens from inside a popup land in that popup. Six new validator tests, popup-window scenario added to fixture section 21, one new E2E case asserting cross-window behavior.
 
 Pending Phase 5 batches:
 
-- **Batch 1.5 — Multi-window extension.** Engine-initiated new browser window via `chrome.windows.create`. Adds `op: 'openWindow'` to the `tab` step (or extends `op: 'open'` with a `newWindow: true` flag — TBD) with optional `windowType: 'normal' | 'popup'`, `width`, `height`, `left`, `top`. Origin stack + close-pops-back behavior reuses Batch 1's tab plumbing. ~1-2 hours.
 - **Batch 2 — Step retry policy.** `retries?: number` (default 0) and `retryDelay?: number` (default 500ms) on every locator-using step. Non-fatal errors retry; `FatalActionError` (disabled / readonly) doesn't. Open question: whether `covered` retries by default. Validator update + interpreter wrap-step helper. ~3 hours.
 - **Batch 3 — Network waits.** New `waitForResponse` step backed by `Network.responseReceived` events. URL pattern auto-detects substring vs `/regex/flags`. Predicate-keyed waiter-set abstraction (reusable for Batch 1's `waitForNew`). `Network.enable` disables disk cache for the session — worth documenting. ~half day.
 - **Batch 4 — Conditional / branching.** `if` step with `xpathExists` + `then` + `else` + `timeoutMs`. `forEach` step with `items` + `as` + `do`. `runScript` becomes recursive; validator gets a depth cap (~20) to catch infinite nesting. Variable scoping: `forEach` writes the current item to `ctx.variables[step.as]`; saved outputs collide across iterations (last-wins) — namespace later if it bites. ~1 day.

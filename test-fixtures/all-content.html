@@ -890,6 +890,33 @@
 }</pre>
         <p class="expected"><strong>Expected:</strong> a brand-new tab opens at the URL in <code>detailUrl</code>, the script fills the detail input, reads it back into <code>lookup</code>, and closes the tab. Focus returns to whichever tab was active when <code>tab open</code> ran. Replace <code>REPLACE_WITH_FIXTURE_URL</code> with the absolute file:// URL of this fixture.</p>
       </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Multi-window: popup lookup window (Batch 1.5)",
+  "tag": "action",
+  "steps": [
+    {
+      "action": "tab",
+      "op": "openWindow",
+      "url": "{{detailUrl}}",
+      "windowType": "popup",
+      "width": 600,
+      "height": 400,
+      "waitForXPath": "//input[@id='detail-input']"
+    },
+    { "action": "fill", "xpath": "//input[@id='detail-input']", "value": "popup-lookup-value" },
+    { "action": "get",  "xpath": "//input[@id='detail-input']", "property": "value", "saveAs": "popupValue" },
+    { "action": "wait", "ms": 1500 },
+    { "action": "tab",  "op": "close" }
+  ],
+  "variables": {
+    "detailUrl": "REPLACE_WITH_FIXTURE_URL#detail"
+  }
+}</pre>
+        <p class="expected"><strong>Expected:</strong> a small 600×400 popup window (no tabs, no address bar) opens at the detail URL. The script fills the input, reads it back into <code>popupValue</code>, waits 1.5s so the popup is visible, then closes — the popup window auto-closes when its only tab closes. Focus returns to the source tab. Uses <code>chrome.windows.create</code> via the extension's <code>tabs</code> permission, so it's <strong>not</strong> subject to the page-side popup blocker — works on <code>file://</code> origins too. Replace <code>REPLACE_WITH_FIXTURE_URL</code> with the absolute file:// URL of this fixture.</p>
+      </div>
     </div>
 
     <script>
@@ -1157,6 +1184,91 @@
   ]
 }</pre>
         <p class="expected"><strong>Expected:</strong> the payment-amount input for row-0 fills with <code>22</code>, a brief Vue re-render settles, then the payment-type dropdown opens. Logs include <code>pierceClosed=true — going straight to CDP DOM walk</code>. Pre-req: navigate to the Shepherd invoice page (logged in) before running. If you see "Locator not found", you're probably not on the Take Payment page or not logged in.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Real example 5: cross-site new-tab lookup ===== -->
+  <section>
+    <h2>R5. Cross-site lookup via new tab — Wikipedia → DuckDuckGo <span class="tag">tab open + get + close</span></h2>
+    <p class="use-case">The canonical CRM-side flow: open another site in a new tab, grab some info, close the tab, type the info into a form on the original page. Uses <code>tab open</code> (extension-side <code>chrome.tabs.create</code> via the <code>tabs</code> permission), so it's not subject to the page's popup blocker. Wikipedia's <code>&lt;h1 id="firstHeading"&gt;</code> has been stable for over a decade; DuckDuckGo's search box uses <code>name="q"</code>. Public sites, no auth, evergreen.</p>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Cross-site lookup via new tab — Wikipedia → DuckDuckGo",
+  "description": "Loads DuckDuckGo in the active tab, opens a Wikipedia article in a new tab via tab open, reads the article heading into a variable, waits 3 seconds so you can see the new tab is active, closes it (focus snaps back to DuckDuckGo), and types the heading into DuckDuckGo's search box. Demonstrates the end-to-end multi-tab pattern with two real public sites.",
+  "tag": "action",
+  "variables": {
+    "wikipediaUrl": "https://en.wikipedia.org/wiki/Chrome_DevTools_Protocol"
+  },
+  "steps": [
+    { "action": "goto", "url": "https://duckduckgo.com",
+      "waitForXPath": "//input[@name='q']" },
+
+    { "action": "tab", "op": "open",
+      "url": "{{wikipediaUrl}}",
+      "waitForXPath": "//h1[@id='firstHeading']" },
+
+    { "action": "get",
+      "xpath": "//h1[@id='firstHeading']",
+      "property": "textContent",
+      "saveAs": "title" },
+
+    { "action": "wait", "ms": 3000 },
+
+    { "action": "tab", "op": "close" },
+
+    { "action": "fill",
+      "xpath": "//input[@name='q']",
+      "value": "{{title}}" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> DuckDuckGo loads, then a new tab opens at the Wikipedia article and Chrome focuses it. After the <code>waitForXPath</code> blocks on the article heading, the script reads <code>"Chrome DevTools Protocol"</code> into <code>title</code>, pauses 3s, then closes the Wikipedia tab. Focus snaps back to the DuckDuckGo tab and the search box gets filled letter-by-letter with the article title. No popup blocker prompts — <code>tab open</code> goes through the extension's <code>tabs</code> permission, not the page's <code>window.open</code>. Swap <code>wikipediaUrl</code> to any Wikipedia article URL to look up that page's title.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Real example 6: cross-site new-window lookup ===== -->
+  <section>
+    <h2>R6. Cross-site lookup via popup window — Wikipedia → DuckDuckGo <span class="tag">tab openWindow + get + close</span></h2>
+    <p class="use-case">Same flow as R5, but the Wikipedia lookup lands in a sized <strong>popup window</strong> (no tabs, no address bar) instead of a same-window tab. Useful for OAuth-style consent dialogs, second-monitor workflows, or any case where you want the lookup visually separated. Uses <code>tab openWindow</code> with <code>windowType: "popup"</code> + explicit dimensions. Like R5, this goes through extension-side <code>chrome.windows.create</code>, so it's not subject to the page's popup blocker. Closing the only tab in a popup window auto-closes the window via Chrome's default behavior.</p>
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Cross-site lookup via popup window — Wikipedia → DuckDuckGo",
+  "description": "Same as R5 but the Wikipedia lookup opens in a 700x500 popup window instead of a tab in the same window. Demonstrates Batch 1.5 — engine-initiated multi-window via chrome.windows.create. The origin stack still works the same way: after tab close pops the popup window, focus returns to the DuckDuckGo tab.",
+  "tag": "action",
+  "variables": {
+    "wikipediaUrl": "https://en.wikipedia.org/wiki/Chrome_DevTools_Protocol"
+  },
+  "steps": [
+    { "action": "goto", "url": "https://duckduckgo.com",
+      "waitForXPath": "//input[@name='q']" },
+
+    { "action": "tab", "op": "openWindow",
+      "url": "{{wikipediaUrl}}",
+      "windowType": "popup",
+      "width": 700,
+      "height": 500,
+      "waitForXPath": "//h1[@id='firstHeading']" },
+
+    { "action": "get",
+      "xpath": "//h1[@id='firstHeading']",
+      "property": "textContent",
+      "saveAs": "title" },
+
+    { "action": "wait", "ms": 3000 },
+
+    { "action": "tab", "op": "close" },
+
+    { "action": "fill",
+      "xpath": "//input[@name='q']",
+      "value": "{{title}}" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> DuckDuckGo loads in the active tab, then a 700×500 popup window opens at the Wikipedia article (minimal chrome — no tabs, no address bar). After the article heading renders, the script reads the title into <code>title</code>, pauses 3s so the popup is visible, then closes — the popup window auto-closes when its only tab closes. Focus returns to the original Chrome window where DuckDuckGo is loaded, and the search box gets filled with the article title. Swap <code>wikipediaUrl</code> to any Wikipedia article or add <code>"left": N, "top": N</code> to position the popup window precisely.</p>
       </div>
     </div>
   </section>

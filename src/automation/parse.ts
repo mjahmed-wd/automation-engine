@@ -193,7 +193,15 @@ export const stepValidators: Record<string, StepValidator> = {
     return null;
   },
   tab: (s, n) => {
-    const KNOWN_OPS = ['open', 'switchTo', 'waitForNew', 'close', 'next', 'previous'];
+    const KNOWN_OPS = [
+      'open',
+      'openWindow',
+      'switchTo',
+      'waitForNew',
+      'close',
+      'next',
+      'previous',
+    ];
     if (!isString(s.op) || !KNOWN_OPS.includes(s.op))
       return `Step ${n}: tab requires "op" (one of ${KNOWN_OPS.join(', ')}).`;
 
@@ -204,6 +212,33 @@ export const stepValidators: Record<string, StepValidator> = {
         return `Step ${n}: tab.open.waitForXPath must be a string.`;
       if (s.waitForTimeoutMs !== undefined && !isNumber(s.waitForTimeoutMs))
         return `Step ${n}: tab.open.waitForTimeoutMs must be a number.`;
+    }
+
+    if (s.op === 'openWindow') {
+      if (!isString(s.url))
+        return `Step ${n}: tab.openWindow requires "url" (string).`;
+      if (s.waitForXPath !== undefined && !isString(s.waitForXPath))
+        return `Step ${n}: tab.openWindow.waitForXPath must be a string.`;
+      if (s.waitForTimeoutMs !== undefined && !isNumber(s.waitForTimeoutMs))
+        return `Step ${n}: tab.openWindow.waitForTimeoutMs must be a number.`;
+      if (
+        s.windowType !== undefined &&
+        s.windowType !== 'normal' &&
+        s.windowType !== 'popup'
+      )
+        return `Step ${n}: tab.openWindow.windowType must be "normal" or "popup".`;
+      // Dimensions must be positive numbers when provided. Position fields
+      // (left/top) allow 0 but reject negatives — chrome.windows.create
+      // tolerates negatives but they almost certainly mean an off-screen
+      // window, which is rarely intentional in an automation script.
+      for (const k of ['width', 'height'] as const) {
+        if (s[k] !== undefined && (!isNumber(s[k]) || (s[k] as number) <= 0))
+          return `Step ${n}: tab.openWindow.${k} must be a positive number.`;
+      }
+      for (const k of ['left', 'top'] as const) {
+        if (s[k] !== undefined && (!isNumber(s[k]) || (s[k] as number) < 0))
+          return `Step ${n}: tab.openWindow.${k} must be a non-negative number.`;
+      }
     }
 
     if (s.op === 'switchTo') {

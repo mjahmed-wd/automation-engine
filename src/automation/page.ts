@@ -470,10 +470,17 @@ export class Page {
     url: string,
     opts: { waitForXPath?: string; waitForTimeoutMs?: number } = {},
   ): Promise<number> {
+    // Open in the CURRENT tab's window, not the engine's original `windowId`.
+    // This matters once Batch 1.5's `openWindow` is in play — when the engine
+    // is driving a tab inside a popup window, a subsequent `tab open` should
+    // land in that popup window, not bounce back to the primary. Fall back to
+    // the original windowId if the lookup fails (e.g., tab was closed).
+    const currentTab = await chrome.tabs.get(this.currentTabId).catch(() => null);
+    const targetWindowId = currentTab?.windowId ?? this.windowId;
     const created = await chrome.tabs.create({
       url,
       active: true,
-      windowId: this.windowId,
+      windowId: targetWindowId,
     });
     if (created.id === undefined) {
       throw new Error('tab open: chrome.tabs.create returned no tab id.');
@@ -490,6 +497,68 @@ export class Page {
       );
     }
     return created.id;
+  }
+
+  /**
+   * Open a new BROWSER WINDOW at `url` and attach the engine to its (single)
+   * tab. Use `windowType: 'popup'` + size fields for a sized lookup window;
+   * default is a regular Chrome window with full chrome.
+   *
+   * Same return-to-origin semantics as `openTab`: pushes the previously-
+   * current tabId onto the origin stack, so a subsequent `closeTab` pops back
+   * to the original tab (in the original window). Closing the only tab in a
+   * popup window auto-closes the window via Chrome's default behavior — no
+   * separate `closeWindow` op is needed.
+   *
+   * `chrome.windows.create` is an extension API, not a page-side call, so it
+   * is NOT subject to the page's popup blocker. Works for any URL — including
+   * `file://` — that the extension itself is allowed to navigate to.
+   */
+  async openWindow(
+    url: string,
+    opts: {
+      windowType?: 'normal' | 'popup';
+      width?: number;
+      height?: number;
+      left?: number;
+      top?: number;
+      waitForXPath?: string;
+      waitForTimeoutMs?: number;
+    } = {},
+  ): Promise<number> {
+    const createInfo: chrome.windows.CreateData = {
+      url,
+      focused: true,
+      type: opts.windowType ?? 'normal',
+    };
+    if (opts.width !== undefined) createInfo.width = opts.width;
+    if (opts.height !== undefined) createInfo.height = opts.height;
+    if (opts.left !== undefined) createInfo.left = opts.left;
+    if (opts.top !== undefined) createInfo.top = opts.top;
+
+    const win = await chrome.windows.create(createInfo);
+    const newTab = win?.tabs?.[0];
+    if (!newTab?.id) {
+      throw new Error(
+        'tab openWindow: chrome.windows.create returned no tab — window creation failed.',
+      );
+    }
+    // Push BEFORE attach so close-on-failure leaves the engine pointing at a
+    // valid tab. (Same invariant as openTab.)
+    this.originStack.push(this.currentTabId);
+    await waitForTabComplete(newTab.id, 30_000);
+    await this.attachTab(newTab.id);
+    this.log(
+      'info',
+      `Opened new ${createInfo.type} window ${win.id} → ${url} (tab ${newTab.id}).`,
+    );
+    if (opts.waitForXPath) {
+      await this.waitFor(
+        { xpath: opts.waitForXPath },
+        { timeoutMs: opts.waitForTimeoutMs },
+      );
+    }
+    return newTab.id;
   }
 
   /**

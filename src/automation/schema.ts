@@ -273,15 +273,20 @@ export interface EvaluateStep extends BaseStep {
 }
 
 /**
- * Multi-tab orchestration. CRM-style flows often pivot through new tabs:
- * click a row → detail opens in new tab → fill → close → repeat. Today the
- * engine is bound to one `tabId` for the lifetime of the run; this step
- * lets a script open, switch between, and close tabs.
+ * Multi-tab / multi-window orchestration. CRM-style flows often pivot through
+ * new tabs (click a row → detail opens → fill → close → repeat) or sized
+ * popup windows (open a lookup window → grab info → close → resume). Today
+ * the engine is bound to one `tabId` at construction; this step lets a
+ * script open new tabs and windows, switch among them, and close them.
  *
  * Ops:
- *   - `open`        — proactively open a new tab at `url` (engine-initiated).
- *                     Pairs with `waitForXPath` / `waitForTimeoutMs` for the
- *                     same SPA-aware wait as `goto`.
+ *   - `open`        — proactively open a new tab in the current window at
+ *                     `url`. Pairs with `waitForXPath` / `waitForTimeoutMs`.
+ *   - `openWindow`  — proactively open a new BROWSER WINDOW at `url`. Use
+ *                     `windowType: 'popup'` + `width` / `height` / `left` /
+ *                     `top` for a sized lookup window; default is a regular
+ *                     Chrome window. Pairs with `waitForXPath` /
+ *                     `waitForTimeoutMs` like `open`.
  *   - `switchTo`    — focus a tab matching `urlMatches` (substring or
  *                     `/regex/flags`) or `index` (0-based, within the window).
  *                     Exactly one of `urlMatches` or `index` must be supplied.
@@ -290,25 +295,49 @@ export interface EvaluateStep extends BaseStep {
  *                     Optional `urlMatches` to disambiguate.
  *   - `close`       — close the current tab and pop back to the previous one.
  *                     The engine maintains an internal origin stack: every
- *                     `open` / `switchTo` / `waitForNew` pushes the prior tab;
- *                     `close` pops + reactivates whatever's on top. Nested
- *                     side-tabs (A opens B inside A) close in the right order.
+ *                     `open` / `openWindow` / `switchTo` / `waitForNew` pushes
+ *                     the prior tab; `close` pops + reactivates whatever's on
+ *                     top. Closing the only tab in a popup window also closes
+ *                     the window (Chrome default).
  *   - `next`/`previous` — cycle to the adjacent tab in the same window.
  *
  *   { "action": "tab", "op": "open", "url": "https://lookup.internal/sku/{{sku}}",
  *     "waitForXPath": "//span[@id='price']" }
+ *   { "action": "tab", "op": "openWindow", "url": "https://en.wikipedia.org/wiki/Foo",
+ *     "windowType": "popup", "width": 700, "height": 500,
+ *     "waitForXPath": "//h1[@id='firstHeading']" }
  *   { "action": "tab", "op": "waitForNew", "urlMatches": "/customers/" }
  *   { "action": "tab", "op": "close" }
  */
 export interface TabStep extends BaseStep {
   action: 'tab';
-  op: 'open' | 'switchTo' | 'waitForNew' | 'close' | 'next' | 'previous';
-  /** For `open`: the URL to navigate the new tab to. Supports `{{var}}`. */
+  op:
+    | 'open'
+    | 'openWindow'
+    | 'switchTo'
+    | 'waitForNew'
+    | 'close'
+    | 'next'
+    | 'previous';
+  /** For `open` / `openWindow`: the URL to navigate the new tab/window to.
+   *  Supports `{{var}}`. */
   url?: string;
-  /** For `open`: optional xpath to wait for after the tab signals 'complete'. */
+  /** For `open` / `openWindow`: optional xpath to wait for after the tab
+   *  signals 'complete'. */
   waitForXPath?: string;
-  /** For `open`: override for the post-load waitFor timeout (default 20s). */
+  /** For `open` / `openWindow`: override for the post-load waitFor timeout
+   *  (default 20s). */
   waitForTimeoutMs?: number;
+  /** For `openWindow`: Chrome window type. `'normal'` is a regular window
+   *  with full chrome; `'popup'` is a minimal window without tabs / address
+   *  bar (good for sized lookup/auth dialogs). Default `'normal'`. */
+  windowType?: 'normal' | 'popup';
+  /** For `openWindow`: dimensions + position in CSS pixels. Omitted →
+   *  Chrome picks defaults. */
+  width?: number;
+  height?: number;
+  left?: number;
+  top?: number;
   /** For `switchTo` / `waitForNew`: URL pattern to match. Plain string is a
    *  substring match; `/regex/flags` is a RegExp. Supports `{{var}}`. */
   urlMatches?: string;

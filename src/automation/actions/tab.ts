@@ -22,6 +22,22 @@ export async function tabAction(step: TabStep, ctx: ExecutionContext, page: Page
       });
       return;
     }
+    case 'openWindow': {
+      if (!step.url) throw new Error('tab openWindow: missing "url".');
+      const url = substituteRaw(step.url, ctx);
+      await page.openWindow(url, {
+        windowType: step.windowType,
+        width: step.width,
+        height: step.height,
+        left: step.left,
+        top: step.top,
+        waitForXPath: step.waitForXPath
+          ? substituteRaw(step.waitForXPath, ctx)
+          : undefined,
+        waitForTimeoutMs: step.waitForTimeoutMs,
+      });
+      return;
+    }
     case 'switchTo': {
       const urlMatches = step.urlMatches
         ? substituteRaw(step.urlMatches, ctx)

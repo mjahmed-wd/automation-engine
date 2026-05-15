@@ -296,6 +296,62 @@ describe('validator: tab step', () => {
     expect(parseAutomation(`{ "action": "tab", "op": "next" }`).steps).toHaveLength(1);
     expect(parseAutomation(`{ "action": "tab", "op": "previous" }`).steps).toHaveLength(1);
   });
+
+  // openWindow — Batch 1.5
+  it('openWindow requires url', () => {
+    expect(() => parseAutomation(`{ "action": "tab", "op": "openWindow" }`)).toThrow(
+      /tab\.openWindow requires "url"/,
+    );
+  });
+
+  it('openWindow rejects unknown windowType', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "tab", "op": "openWindow", "url": "https://x", "windowType": "panel" }`,
+      ),
+    ).toThrow(/windowType must be "normal" or "popup"/);
+  });
+
+  it('openWindow accepts windowType normal and popup', () => {
+    expect(
+      parseAutomation(
+        `{ "action": "tab", "op": "openWindow", "url": "https://x", "windowType": "normal" }`,
+      ).steps,
+    ).toHaveLength(1);
+    expect(
+      parseAutomation(
+        `{ "action": "tab", "op": "openWindow", "url": "https://x", "windowType": "popup" }`,
+      ).steps,
+    ).toHaveLength(1);
+  });
+
+  it('openWindow rejects non-positive width', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "tab", "op": "openWindow", "url": "https://x", "width": 0 }`,
+      ),
+    ).toThrow(/width must be a positive number/);
+    expect(() =>
+      parseAutomation(
+        `{ "action": "tab", "op": "openWindow", "url": "https://x", "width": "600" }`,
+      ),
+    ).toThrow(/width must be a positive number/);
+  });
+
+  it('openWindow rejects negative left/top', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "tab", "op": "openWindow", "url": "https://x", "left": -10 }`,
+      ),
+    ).toThrow(/left must be a non-negative number/);
+  });
+
+  it('openWindow accepts a full popup spec', () => {
+    const out = parseAutomation(
+      `{ "action": "tab", "op": "openWindow", "url": "https://x", "windowType": "popup", "width": 700, "height": 500, "left": 100, "top": 50, "waitForXPath": "//h1", "waitForTimeoutMs": 8000 }`,
+    );
+    expect(out.steps).toHaveLength(1);
+  });
 });
 
 describe('registry consistency: stepValidators vs actions/index.ts', () => {
