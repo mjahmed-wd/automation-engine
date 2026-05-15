@@ -1,4 +1,4 @@
-# debug-and-automation-wxt
+# Automation Engine
 
 A JSON-driven web automation runner that ships as a Chrome MV3 extension. Think of it as a tiny Playwright that lives inside your own browser: paste a JSON script into the side panel, hit Run, and the engine drives the active tab via `chrome.debugger` + the Chrome DevTools Protocol (CDP).
 

@@ -4,13 +4,13 @@ import { defineConfig } from 'wxt';
 export default defineConfig({
   modules: ['@wxt-dev/module-react'],
   manifest: {
-    name: 'Debug & Automation',
+    name: 'Automation Engine',
     description:
-      'A sidebar extension that automates pages using the Chrome Debugger API (CDP)',
+      'JSON-driven web automation runner — drives the active tab via Chrome DevTools Protocol',
     permissions: ['sidePanel', 'tabs', 'debugger'],
     host_permissions: ['<all_urls>'],
     action: {
-      default_title: 'Open Debug & Automation sidebar',
+      default_title: 'Open Automation Engine sidebar',
     },
   },
 });

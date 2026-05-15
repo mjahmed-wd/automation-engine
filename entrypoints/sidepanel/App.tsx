@@ -86,7 +86,7 @@ export function App() {
   return (
     <main className="app">
       <header>
-        <h1>Debug &amp; Automation</h1>
+        <h1>Automation Engine</h1>
         <p className="subtitle">JSON-driven · chrome.debugger / CDP</p>
       </header>
 
