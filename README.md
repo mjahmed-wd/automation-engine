@@ -27,12 +27,13 @@ Built on [WXT](https://wxt.dev/) + React 19 + TypeScript. XPath-only locators wi
 5. [Script injection via `evaluate`](#script-injection-via-evaluate)
 6. [Multi-tab orchestration](#multi-tab-orchestration)
 7. [Network waits](#network-waits)
-8. [Locator strategy](#locator-strategy)
-9. [Error handling](#error-handling)
-10. [Architecture (for contributors)](#architecture-for-contributors)
-11. [Testing](#testing)
-12. [Known limitations & non-goals](#known-limitations--non-goals)
-13. [Phases history](#phases-history)
+8. [Conditional + loops](#conditional--loops)
+9. [Locator strategy](#locator-strategy)
+10. [Error handling](#error-handling)
+11. [Architecture (for contributors)](#architecture-for-contributors)
+12. [Testing](#testing)
+13. [Known limitations & non-goals](#known-limitations--non-goals)
+14. [Phases history](#phases-history)
 
 ---
 
@@ -67,7 +68,7 @@ Open any site (e.g., `example.com`), then paste this into the side panel:
 
 The log shows `Got "Example Domain" → title`, and the saved output renders below the editor.
 
-For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **24 fixture sections + 7 real-world examples** covering every action, every locator path, the multi-tab/window flow, script injection, the retry policy, and network waits.
+For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **25 fixture sections + 7 real-world examples** covering every action, every locator path, the multi-tab/window flow, script injection, the retry policy, and network waits.
 
 ---
 
@@ -117,7 +118,7 @@ Outputs from earlier `get` / `evaluate` / `describe` steps take precedence over 
 
 ## Action reference
 
-Fifteen actions, grouped by purpose. Each has a one-paragraph use case and a minimal example. For variants and edge cases, see the corresponding section in `test-fixtures/all-content.html`. Multi-tab, script-injection, and network-wait capabilities get their own sections after the reference.
+Seventeen actions, grouped by purpose. Each has a one-paragraph use case and a minimal example. For variants and edge cases, see the corresponding section in `test-fixtures/all-content.html`. Multi-tab, script-injection, network-wait, and conditional/branching capabilities get their own sections after the reference.
 
 ### Navigation
 
@@ -286,6 +287,40 @@ Multi-tab + multi-window orchestration. Seven ops: `open` (engine-initiated new 
 The engine keeps an internal origin stack: every op that changes the active tab pushes the previously-current tabId; `close` pops and reactivates whatever's on top. Nested side-tabs (open A → open B inside A → close B → still in A → close A → back to original) close in the right order. Already-attached tabs cost only a pointer flip on re-entry — no re-attach overhead for ping-pong patterns.
 
 See **[Multi-tab orchestration](#multi-tab-orchestration)** below for the full flow including page-triggered vs script-triggered patterns and the `urlMatches` syntax.
+
+### Control flow
+
+#### `if`
+
+Branch on whether an XPath matches the page. `then` runs on match, `else` (optional) runs on miss. Timing is explicit — required `timeoutMs` (poll) OR `wait: false` (instant DOM check), no defaults. The validator rejects neither-set.
+
+```jsonc
+{ "action": "if",
+  "xpathExists": "//div[@class='error-banner']",
+  "timeoutMs": 1000,
+  "then": [ { "action": "click", "xpath": "//button[.='Retry']" } ],
+  "else": [ { "action": "wait", "ms": 100 } ] }
+```
+
+`then` and `else` accept any AutomationStep, including more `if` / `forEach`. The interpreter's `runStepArray` is recursive; the validator caps nesting at 20 levels.
+
+#### `forEach`
+
+Iterate a list of items. `items` is either a JSON array `["a","b","c"]` or a `{{var}}` reference to a comma-separated string. `as` names the loop variable, set in `ctx.variables[as]` per iteration and removed after the loop.
+
+```jsonc
+{ "action": "forEach",
+  "as": "id",
+  "items": ["C-1001", "C-1002", "C-1003"],
+  "do": [
+    { "action": "tab", "op": "open", "url": "/customers/{{id}}/edit" },
+    { "action": "fill", "xpath": "//textarea[@name='note']", "value": "Processed {{id}}" },
+    { "action": "click", "xpath": "//button[.='Save']" },
+    { "action": "tab", "op": "close" }
+  ] }
+```
+
+See **[Conditional + loops](#conditional--loops)** below for the full story including variable scoping and the nesting-depth cap.
 
 ---
 
@@ -614,6 +649,78 @@ See fixture Section R7 for the cookbook entry with the Copy-JSON button.
 
 ---
 
+## Conditional + loops
+
+`if` and `forEach` add control flow to what was a purely linear language. The interpreter's `runStepArray` recurses into `if.then` / `if.else` / `forEach.do`, so any AutomationStep — including more conditionals and loops — can nest inside. The validator caps nesting at 20 levels to catch buggy generators.
+
+### `if` — branching
+
+`if` checks whether an XPath matches the page right now. Two timing modes, exactly one required:
+
+- **`timeoutMs: N`** — poll the page for up to N milliseconds. Use when the matching element renders asynchronously (e.g., an error banner that appears 200ms after a save click).
+- **`wait: false`** — instant DOM check, no polling. Use when you know the page state is settled (typically right after another step that already waited).
+
+```jsonc
+{ "action": "if",
+  "xpathExists": "//div[@class='error-banner']",
+  "timeoutMs": 1000,
+  "then": [ { "action": "click", "xpath": "//button[.='Retry']" } ],
+  "else": [ /* no-op or recovery */ ] }
+```
+
+`else` is optional — omit it for "fire-on-match, no-op-on-miss" patterns.
+
+### `forEach` — iteration
+
+`forEach` runs `do` once per item in `items`, exposing the current value as `{{<as>}}` for substitution inside the loop body.
+
+```jsonc
+{ "action": "forEach",
+  "as": "id",
+  "items": ["C-1001", "C-1002", "C-1003"],
+  "do": [
+    { "action": "tab", "op": "open", "url": "/customers/{{id}}/edit" },
+    { "action": "fill", "xpath": "//input[@name='status']", "value": "reviewed" },
+    { "action": "tab", "op": "close" }
+  ] }
+```
+
+`items` accepts two shapes:
+
+- **JSON array** of strings — `["a", "b", "c"]` literally in the script. Use this for small, known-up-front lists.
+- **String** with `{{var}}` substitution — `"{{customerIds}}"` resolves the variable, splits on `,`, trims each entry, and skips empty entries. Use this for "process this comma-separated list" patterns.
+
+The loop is sequential — one iteration at a time, awaiting each. No parallel execution for v1.
+
+### Variable scoping in `forEach`
+
+`ctx.variables[step.as]` is set to the current item at the start of each iteration. After the loop ends, the variable is **removed** so `{{<as>}}` substitution outside the loop doesn't see a stale value. If the variable existed before the loop, its prior value is restored on exit.
+
+**Caveat — output collision.** Outputs saved inside the loop via `saveAs` collide across iterations (last write wins). Most workflows don't need per-iteration outputs; for those that do, write into the page DOM and read all values back after the loop. Namespaced outputs (`{step.as}_{i}`) may come in a future iteration if real demand surfaces.
+
+### Combining patterns
+
+The recursive interpreter lets you compose these naturally. "For each customer, click Save, and if a server error banner shows up, click Retry":
+
+```jsonc
+{ "action": "forEach",
+  "as": "id",
+  "items": ["A", "B", "C"],
+  "do": [
+    { "action": "tab", "op": "open", "url": "/customers/{{id}}/edit" },
+    { "action": "click", "xpath": "//button[normalize-space(.)='Save']" },
+    { "action": "if",
+      "xpathExists": "//div[@class='error-banner']",
+      "timeoutMs": 1500,
+      "then": [ { "action": "click", "xpath": "//button[.='Retry']" } ] },
+    { "action": "tab", "op": "close" }
+  ] }
+```
+
+See fixture Section 25 for four pasteable scenarios covering if-then, if-else with `wait: false`, forEach over a JSON array, forEach over a comma-separated variable, and the nested forEach + if pattern shown above.
+
+---
+
 ## Locator strategy
 
 XPath only. One language for every DOM construct: light DOM, open Shadow roots, closed Shadow roots, same-origin iframes, text relations.
@@ -716,9 +823,9 @@ The log auto-scrolls. Click **Clear** to reset.
 
 ```
 src/automation/
-├── schema.ts              Step types + AutomationStep union (includes TabStep + WaitForResponseStep), substituteRaw / substituteXPath / xpathStringLiteral
-├── parse.ts               JSON5 parse + validateScript (the per-action validator map)
-├── interpreter.ts         runScript — walks AutomationStep[] and dispatches via the action registry
+├── schema.ts              Step types + AutomationStep union (includes TabStep + WaitForResponseStep + IfStep + ForEachStep), substituteRaw / substituteXPath / xpathStringLiteral
+├── parse.ts               JSON5 parse + validateScript (the per-action validator map) — recursive into if/forEach with depth cap
+├── interpreter.ts         runScript + runStepArray — dispatches via the action registry; runStepArray exported for recursive use by if/forEach handlers
 ├── locator.ts             buildActionExpression / buildResolveExpression / buildDescribeExpression / buildCallFunctionExpression
 ├── page.ts                Page class — chrome.debugger client, multi-tab attachment map, fast-path + CDP, dialog handling, Network event router
 ├── errors.ts              withLocatorContext wrapper for structured action-handler errors
@@ -742,7 +849,9 @@ src/automation/
     ├── dialog.ts
     ├── describe.ts
     ├── tab.ts             Multi-tab + multi-window orchestration (open / openWindow / switchTo / waitForNew / close / next / previous)
-    └── waitForResponse.ts Network response wait (Batch 3) — urlMatches + status filter + opt-in body read
+    ├── waitForResponse.ts Network response wait (Batch 3) — urlMatches + status filter + opt-in body read
+    ├── if.ts              Conditional branching (Batch 4) — xpathExists + then/else, timeoutMs or wait:false
+    └── forEach.ts         Iteration (Batch 4) — array or comma-string items, per-iteration ctx.variables[as]
 
 entrypoints/
 ├── background/            Service worker — message dispatcher + automation runner
@@ -760,10 +869,10 @@ automations/               Local script library — gitignored except .gitkeep
                            import.meta.glob picks up every *.json at build time
 
 test-fixtures/
-└── all-content.html       Self-documenting fixture: 24 sections (every action + multi-tab + script-injection + retry + network waits)
-                           + 7 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo
-                           new-tab, Wikipedia/DuckDuckGo popup-window, httpbin form POST + waitForResponse).
-                           Doubles as the smoke-automation target.
+└── all-content.html       Self-documenting fixture: 25 sections (every action + multi-tab + script-injection
+                           + retry + network waits + conditional/loops) + 7 real-world examples (MUI, W3Schools,
+                           react-select, Shepherd, Wikipedia/DuckDuckGo new-tab, Wikipedia/DuckDuckGo popup-window,
+                           httpbin form POST + waitForResponse). Doubles as the smoke-automation target.
 
 e2e/                       Playwright suite
 ├── fixtures/extension.ts  Persistent-context fixture loading the built extension
@@ -773,7 +882,8 @@ e2e/                       Playwright suite
     ├── fatal-paths.spec.ts
     ├── multi-tab.spec.ts  Page-triggered + script-triggered + openWindow + negative-timeout
     ├── retry.spec.ts      Baseline fail-fast + retry-succeeds + covered-overlay
-    └── waitForResponse.spec.ts  URL match + saveBody + status filter + timeout
+    ├── waitForResponse.spec.ts  URL match + saveBody + status filter + timeout
+    └── branching.spec.ts  if-then + if-else + forEach + nested forEach+if
 
 src/automation/*.test.ts   Vitest unit tests (schema, parse, locator, interpreter, event-waiter)
 ```
@@ -809,7 +919,7 @@ npm test           # one-shot
 npm run test:watch # watch mode
 ```
 
-110 tests, runs in under 2 seconds. No browser, no extension load.
+129 tests, runs in under 2 seconds. No browser, no extension load.
 
 ### E2E tests (Playwright)
 
@@ -821,7 +931,7 @@ npm run test:e2e                  # builds extension first, then runs suite
 npm run test:e2e:ui               # interactive UI
 ```
 
-15 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 4 multi-tab cases (page-triggered fixme'd; script-triggered, openWindow popup, negative timeout), 3 retry cases (baseline fail-fast, retry succeeds, covered-overlay clears), 4 waitForResponse cases (URL match, saveBody, status filter rejects, timeout). Runs in ~4-5 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
+19 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 4 multi-tab cases (page-triggered fixme'd; script-triggered, openWindow popup, negative timeout), 3 retry cases (baseline fail-fast, retry succeeds, covered-overlay clears), 4 waitForResponse cases (URL match, saveBody, status filter rejects, timeout), 4 branching cases (if-then, if-else, forEach array, nested forEach+if). Runs in ~5-6 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
 
 Three E2E-specific shims live in the test setup; touch them only if you understand the comments first:
 
@@ -837,7 +947,7 @@ Three E2E-specific shims live in the test setup; touch them only if you understa
 2. Run `phase4-fixture-smoke.json` from the dropdown (lives in your `automations/` folder).
 3. Watch the panel log: every action should report green, every result paragraph in the fixture should reflect the expected outcome.
 
-The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 24 sections (every action plus multi-tab, script-injection, retry, and network-wait cookbooks) plus 7 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo new-tab, Wikipedia/DuckDuckGo popup-window, httpbin form POST + waitForResponse).
+The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 25 sections (every action plus multi-tab, script-injection, retry, network-wait, and conditional/loops cookbooks) plus 7 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo new-tab, Wikipedia/DuckDuckGo popup-window, httpbin form POST + waitForResponse).
 
 ---
 
@@ -849,7 +959,9 @@ These are *not* bugs — they're explicit scope choices.
 - **`evaluate` runs in the main frame only.** Reach into same-origin iframes from inside your expression (`document.querySelector('iframe').contentWindow.…`); cross-origin iframe evaluation isn't supported.
 - **`upload` requires absolute file paths.** Relative paths get rejected at action-handler time. Chrome resolves relative paths against an unpredictable cwd.
 - **No built-in credentials handling.** Secrets currently live in script `variables`, which means they're in the JSON. A `chrome.storage.local`-backed `{{secrets.password}}` mechanism is a future-phase candidate.
-- **No branching or loops.** Scripts are linear. Phase 5 Batch 4 adds `if` (with `xpathExists`) and `forEach` so a single script can iterate a list of customer IDs or take different paths based on page state.
+- **`forEach` iterates sequentially.** One iteration at a time, awaiting each. No parallel iteration — multi-iteration speedups would need concurrent debugger sessions per tab; not worth the complexity for v1.
+- **`forEach` saveAs outputs collide.** When a step inside a loop uses `saveAs`, each iteration overwrites the prior one (last-wins). Most workflows don't need per-iteration outputs; for those that do, write into the page DOM and read all values back after the loop.
+- **`if` instant-check (`wait: false`) is main-frame only.** Same scope as the `evaluate` action — reach into same-origin iframes by composing the xpath if needed.
 - **`waitForResponse` is main-tab scoped.** Responses fired by auto-attached cross-origin iframe targets (OOPIFs) aren't captured by the engine's per-tab `EventWaiter`. Most CRM XHRs come from the main frame; revisit if a real workflow needs OOPIF-scoped responses.
 - **Response body size has no cap.** `saveBody` puts the full string body into `ctx.outputs` regardless of size. A 5MB JSON response works but the memory footprint is real. Avoid `saveBody` on large payloads or extract just what you need via an `evaluate` step on the matched URL.
 - **No screenshots-on-failure.** `Page.captureScreenshot` is a one-call wrapper away — declined for now (engine errors are detailed enough). Easy to add later if real demand surfaces.
@@ -873,9 +985,8 @@ Mapping commit history to milestones:
 - **Phase 5 Batch 1.5** — Multi-window extension: `op: 'openWindow'` on the `tab` step, backed by `chrome.windows.create`. Supports `windowType: 'normal' | 'popup'` plus optional `width` / `height` / `left` / `top`. Reuses Batch 1's origin stack so `close` pops back to the source tab in the source window. `openTab` patched to use the current tab's `windowId` (not the engine's primary) so opens from inside a popup land in that popup. Six new validator tests, popup-window scenario added to fixture section 21, one new E2E case asserting cross-window behavior.
 - **Phase 5 Batch 2** — Step retry policy: `retries?: number` (default 0, capped at 5) and `retryDelay?: number` (default 500ms) on every locator-using step. Implemented as a `RetryFields` mixin extended by every retry-eligible interface, validated by a shared `validateRetryFields` helper. `interpreter.ts` wraps every step in `runStepWithRetry` with a decision tree that retries non-fatal errors and `FatalActionError` with reason `'covered'`, but short-circuits on `'disabled'`, `'read-only'`, `'no-match'`, `'not-a-select'`, and `'unknown'`. `FatalActionError` grew a typed `reason: FatalReason` field; all six throw sites in `page.ts` now pass the reason through. Eight validator unit tests, nine interpreter unit tests, fixture section 23 with two retry scenarios, three E2E cases (baseline fail-fast, retry succeeds, covered-overlay clears).
 - **Phase 5 Batch 3** — Network waits: new `waitForResponse` step backed by `Network.responseReceived` events. URL match via `parseUrlMatcher` (substring or `/regex/flags`); status filter accepts number, array, or range object; HTTP method enum filter; opt-in `saveBody` triggers `Network.getResponseBody`. Pulled the on-demand listener pattern out of `tabs.ts` into a new `EventWaiter<T>` abstraction with race-tolerant ringbuffer — `waitForNewTab` was refactored to use it (the race-tolerant `chrome.tabs.query` pre-check went away). `Network.enable` documented as disabling disk cache for the attached session. 12 EventWaiter unit tests, 10 validator tests for waitForResponse, fixture section 24 with four scenarios, four E2E cases (URL match, saveBody, status filter rejects, timeout).
+- **Phase 5 Batch 4** — Conditional / branching: new `if` and `forEach` step types. `if` takes `xpathExists` + `then` + optional `else`, with explicit timing — required `timeoutMs` OR `wait: false`, no defaults. `forEach` takes `items` (JSON array or comma-separated `{{var}}`) + `as` + `do`; the loop variable is set per-iteration in `ctx.variables[as]` and removed after the loop (pre-existing values restored). Interpreter refactored: `runStepArray` extracted from `runScript` and exported for recursive use by the `if` / `forEach` handlers. Validator made recursive with a depth cap of 20 to catch buggy generators. 18 new validator tests, 3 new interpreter tests pinning variable-scope and comma-split behavior, fixture section 25 with five scenarios, four E2E cases (if-then, if-else with `wait: false`, forEach array, nested forEach + if).
 
-Pending Phase 5 batches:
-
-- **Batch 4 — Conditional / branching.** `if` step with `xpathExists` + `then` + `else` + `timeoutMs`. `forEach` step with `items` + `as` + `do`. `runScript` becomes recursive; validator gets a depth cap (~20) to catch infinite nesting. Variable scoping: `forEach` writes the current item to `ctx.variables[step.as]`; saved outputs collide across iterations (last-wins) — namespace later if it bites. ~1 day.
+**Phase 5 complete.** Multi-tab/window orchestration, retry policy, network waits, and conditional/loops all shipped. 17 actions total. The engine covers the script patterns CRM automation realistically needs.
 
 Skipped scope (explicitly): nested-iframe forwarding (low real-world need for CRM workflows; revisit if a concrete use case surfaces).

@@ -285,6 +285,50 @@ export const stepValidators: Record<string, StepValidator> = {
 
     return validateRetryFields(s, n);
   },
+  if: (s, n) => {
+    if (!isString(s.xpathExists))
+      return `Step ${n}: if requires "xpathExists" (string).`;
+    if (!Array.isArray(s.then))
+      return `Step ${n}: if requires "then" (array of steps).`;
+    if (s.else !== undefined && !Array.isArray(s.else))
+      return `Step ${n}: if.else must be an array of steps when provided.`;
+    // Type-check `wait` first so a bogus `wait: true` surfaces with a
+    // specific error instead of falling into the more generic "requires
+    // either timeoutMs or wait:false" branch below.
+    if (s.wait !== undefined && s.wait !== false)
+      return `Step ${n}: if.wait may only be set to literal false.`;
+    if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
+      return `Step ${n}: if.timeoutMs must be a number.`;
+    // Timing: exactly one of timeoutMs or wait:false must be specified.
+    // Forcing the choice keeps scripts self-documenting and avoids
+    // surprising default behavior.
+    const hasTimeout = s.timeoutMs !== undefined;
+    const hasWaitFalse = s.wait === false;
+    if (!hasTimeout && !hasWaitFalse) {
+      return (
+        `Step ${n}: if requires either "timeoutMs" (poll for that long) or ` +
+        `"wait": false (check current DOM instantly). Pick one.`
+      );
+    }
+    return null;
+  },
+  forEach: (s, n) => {
+    if (!isString(s.as) || s.as.length === 0)
+      return `Step ${n}: forEach requires "as" (non-empty string — the loop variable name).`;
+    if (s.items === undefined || s.items === null)
+      return `Step ${n}: forEach requires "items" (string or array of strings).`;
+    if (typeof s.items !== 'string' && !Array.isArray(s.items))
+      return `Step ${n}: forEach.items must be a string or array of strings.`;
+    if (Array.isArray(s.items)) {
+      for (let i = 0; i < s.items.length; i++) {
+        if (!isString(s.items[i]))
+          return `Step ${n}: forEach.items[${i}] must be a string.`;
+      }
+    }
+    if (!Array.isArray(s.do))
+      return `Step ${n}: forEach requires "do" (array of steps).`;
+    return null;
+  },
   waitForResponse: (s, n) => {
     if (!isString(s.urlMatches))
       return `Step ${n}: waitForResponse requires "urlMatches" (string).`;
@@ -340,28 +384,81 @@ export const stepValidators: Record<string, StepValidator> = {
   },
 };
 
+/** Maximum nesting depth for `if.then` / `if.else` / `forEach.do`. Bounded to
+ *  catch buggy script generators that produce infinite nesting; the limit is
+ *  generous enough that real workflows shouldn't bump into it. */
+const MAX_NESTING_DEPTH = 20;
+
 function validateScript(script: AutomationScript): void {
   if (!Array.isArray(script.steps)) {
     throw new Error('Script must have a "steps" array.');
   }
-  for (let i = 0; i < script.steps.length; i++) {
-    const step = script.steps[i] as unknown;
+  validateStepArray(script.steps, 0, '');
+}
+
+/**
+ * Recursive step-array validator (Batch 4). Walks the array, runs the
+ * per-step validator on each, and recurses into `if.then` / `if.else` /
+ * `forEach.do`. Tracks depth so accidental infinite nesting fails fast at
+ * parse time rather than stack-overflowing at runtime.
+ *
+ * `pathPrefix` is the human-readable breadcrumb used in error messages —
+ * empty for top-level, "Step 3 (if.then)" when recursing, etc. Makes
+ * "Step 2: fill requires value" become "Step 3 (forEach.do) step 2:
+ * fill requires value" when the bad step is nested.
+ */
+function validateStepArray(
+  steps: unknown[],
+  depth: number,
+  pathPrefix: string,
+): void {
+  if (depth > MAX_NESTING_DEPTH) {
+    throw new Error(
+      `${pathPrefix || 'script'}: nested step arrays exceeded max depth ${MAX_NESTING_DEPTH}. ` +
+        `If you actually need this much nesting, restructure with `+
+        `intermediate variables — but it's almost always a buggy generator.`,
+    );
+  }
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i] as unknown;
     const n = i + 1;
+    const prefix = pathPrefix ? `${pathPrefix} step ${n}` : `Step ${n}`;
     if (!step || typeof step !== 'object') {
-      throw new Error(`Step ${n}: must be an object.`);
+      throw new Error(`${prefix}: must be an object.`);
     }
     const s = step as Record<string, unknown>;
     if (typeof s.action !== 'string') {
-      throw new Error(`Step ${n}: "action" must be a string.`);
+      throw new Error(`${prefix}: "action" must be a string.`);
     }
     const validator = stepValidators[s.action];
     if (!validator) {
       throw new Error(
-        `Step ${n}: unknown action "${s.action}". ` +
+        `${prefix}: unknown action "${s.action}". ` +
           `Known: ${Object.keys(stepValidators).join(', ')}`,
       );
     }
+    // The per-step validators write messages as `Step N: ...`. When we're
+    // nested, those are still useful but ambiguous. Rewrite the leading
+    // "Step N:" to include the path breadcrumb.
     const err = validator(s, n);
-    if (err) throw new Error(err);
+    if (err) {
+      if (pathPrefix && err.startsWith(`Step ${n}:`)) {
+        throw new Error(`${prefix}${err.substring(`Step ${n}`.length)}`);
+      }
+      throw new Error(err);
+    }
+    // Recurse into nested step arrays.
+    if (s.action === 'if') {
+      if (Array.isArray(s.then)) {
+        validateStepArray(s.then, depth + 1, `${prefix} (if.then)`);
+      }
+      if (Array.isArray(s.else)) {
+        validateStepArray(s.else, depth + 1, `${prefix} (if.else)`);
+      }
+    } else if (s.action === 'forEach') {
+      if (Array.isArray(s.do)) {
+        validateStepArray(s.do, depth + 1, `${prefix} (forEach.do)`);
+      }
+    }
   }
 }

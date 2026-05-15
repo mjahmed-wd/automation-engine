@@ -1347,6 +1347,211 @@
   </section>
 
   <!-- ===================================================================== -->
+  <section id="branching-section">
+    <h2>25. Conditional + loops <span class="tag">if + forEach</span></h2>
+    <p class="use-case">Phase 5 Batch 4: <code>if</code> branches on whether an xpath matches the page; <code>forEach</code> iterates over a list. Both step types nest — <code>forEach</code> inside <code>if</code>, <code>if</code> inside <code>forEach</code>, etc. The interpreter's <code>runStepArray</code> is recursive; the validator caps nesting at 20 levels to catch buggy generators.</p>
+    <p class="use-case">Two widgets below: a toggle that shows/hides an error banner (drives the <code>if</code> demo), and a 5-row table whose rows each have a unique result paragraph (drives the <code>forEach</code> demo). Calls <code>window.__resetBranchingDemo()</code> at the start of each scenario so they're re-runnable.</p>
+
+    <div class="widget" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px;">
+      <label style="display: flex; align-items: center; gap: 6px;">
+        <input type="checkbox" id="branch-banner-toggle">
+        <span>Show error banner</span>
+      </label>
+      <div id="branch-banner" style="display: none; padding: 8px 12px; background: #fdd; border: 1px solid #d66; border-radius: 4px; color: #800;">
+        <strong>Error:</strong> something went wrong. <button type="button" id="branch-retry-btn" style="margin-left: 8px;">Retry</button>
+      </div>
+      <p class="result" id="branch-result-if">unset</p>
+    </div>
+
+    <div class="widget">
+      <table style="border-collapse: collapse;">
+        <thead><tr><th style="text-align:left;padding:4px 8px;">Row</th><th style="text-align:left;padding:4px 8px;">Action</th><th style="text-align:left;padding:4px 8px;">Result</th></tr></thead>
+        <tbody id="branch-rows">
+          <tr><td style="padding:4px 8px;">A</td><td style="padding:4px 8px;"><button type="button" class="branch-row-btn" data-id="A">Process</button></td><td style="padding:4px 8px;"><span class="branch-row-result" data-id="A">pending</span></td></tr>
+          <tr><td style="padding:4px 8px;">B</td><td style="padding:4px 8px;"><button type="button" class="branch-row-btn" data-id="B">Process</button></td><td style="padding:4px 8px;"><span class="branch-row-result" data-id="B">pending</span></td></tr>
+          <tr><td style="padding:4px 8px;">C</td><td style="padding:4px 8px;"><button type="button" class="branch-row-btn" data-id="C">Process</button></td><td style="padding:4px 8px;"><span class="branch-row-result" data-id="C">pending</span></td></tr>
+          <tr><td style="padding:4px 8px;">D</td><td style="padding:4px 8px;"><button type="button" class="branch-row-btn" data-id="D">Process</button></td><td style="padding:4px 8px;"><span class="branch-row-result" data-id="D">pending</span></td></tr>
+          <tr><td style="padding:4px 8px;">E</td><td style="padding:4px 8px;"><button type="button" class="branch-row-btn" data-id="E">Process</button></td><td style="padding:4px 8px;"><span class="branch-row-result" data-id="E">pending</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="scenarios">
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Branching: if-then path (banner shown)",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetBranchingDemo({ banner: true })" },
+    {
+      "action": "if",
+      "xpathExists": "//div[@id='branch-banner' and not(contains(@style, 'display: none'))]",
+      "timeoutMs": 500,
+      "then": [
+        { "action": "click", "xpath": "//button[@id='branch-retry-btn']" }
+      ],
+      "else": [
+        { "action": "evaluate", "expression": "document.getElementById('branch-result-if').textContent = 'no-banner-path'" }
+      ]
+    },
+    { "action": "get", "xpath": "//p[@id='branch-result-if']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> reset forces the banner ON, then <code>if</code> matches it and runs the <code>then</code> branch which clicks Retry. The Retry handler writes <code>"retried"</code> to the result paragraph. Output: <code>out = "retried"</code>.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Branching: if-else path (banner hidden)",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetBranchingDemo({ banner: false })" },
+    {
+      "action": "if",
+      "xpathExists": "//div[@id='branch-banner' and not(contains(@style, 'display: none'))]",
+      "wait": false,
+      "then": [
+        { "action": "click", "xpath": "//button[@id='branch-retry-btn']" }
+      ],
+      "else": [
+        { "action": "evaluate", "expression": "document.getElementById('branch-result-if').textContent = 'no-banner-path'" }
+      ]
+    },
+    { "action": "get", "xpath": "//p[@id='branch-result-if']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> banner hidden, instant <code>wait: false</code> check returns false, <code>else</code> branch runs and writes <code>"no-banner-path"</code>. Output: <code>out = "no-banner-path"</code>. Demonstrates the instant-check escape hatch for cases where you know the page state is already settled.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Branching: forEach over JSON array",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetBranchingDemo()" },
+    {
+      "action": "forEach",
+      "as": "id",
+      "items": ["A", "B", "C", "D", "E"],
+      "do": [
+        { "action": "click", "xpath": "//button[contains(concat(' ', normalize-space(@class), ' '), ' branch-row-btn ') and @data-id='{{id}}']" }
+      ]
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> the engine clicks Process on each of the 5 rows in turn. Side panel log shows <code>forEach (5 items, as="id")</code> followed by <code>Iteration 1/5: id="A"</code> through <code>Iteration 5/5: id="E"</code>, with the click + log lines between. Visually, every row's Result column changes from <code>pending</code> to <code>done</code>. Re-runnable: <code>__resetBranchingDemo()</code> resets all rows back to <code>pending</code>.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Branching: forEach over comma-separated variable",
+  "tag": "action",
+  "variables": {
+    "rows": "A, B, E"
+  },
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetBranchingDemo()" },
+    {
+      "action": "forEach",
+      "as": "id",
+      "items": "{{rows}}",
+      "do": [
+        { "action": "click", "xpath": "//button[contains(concat(' ', normalize-space(@class), ' '), ' branch-row-btn ') and @data-id='{{id}}']" }
+      ]
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> the script processes only rows A, B, and E (rows C and D stay <code>pending</code>). Demonstrates that <code>items</code> resolves a <code>{{var}}</code> string, splits on commas, and trims whitespace per entry — useful when the row list is computed by a previous <code>get</code> or <code>evaluate</code> step.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Branching: nested if inside forEach",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetBranchingDemo({ banner: false })" },
+    {
+      "action": "forEach",
+      "as": "id",
+      "items": ["A", "C", "E"],
+      "do": [
+        { "action": "click", "xpath": "//button[contains(concat(' ', normalize-space(@class), ' '), ' branch-row-btn ') and @data-id='{{id}}']" },
+        {
+          "action": "if",
+          "xpathExists": "//div[@id='branch-banner' and not(contains(@style, 'display: none'))]",
+          "wait": false,
+          "then": [
+            { "action": "click", "xpath": "//button[@id='branch-retry-btn']" }
+          ]
+        }
+      ]
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> three iterations (A, C, E). On each, click the row's Process button, then check whether the error banner appeared and click Retry if so. Banner stays hidden in this scenario, so the <code>then</code> branch never fires — all three rows complete normally. The pattern is real-CRM-shaped: "process each item, and recover from intermittent errors as they show up." Note the omitted <code>else</code> — when there's no recovery action needed, just leave it off.</p>
+      </div>
+
+    </div>
+
+    <script>
+      (function () {
+        // Banner toggle wiring
+        var bannerToggle = document.getElementById('branch-banner-toggle');
+        var banner = document.getElementById('branch-banner');
+        var retryBtn = document.getElementById('branch-retry-btn');
+        var resultIf = document.getElementById('branch-result-if');
+        function syncBanner() {
+          if (banner) banner.style.display = bannerToggle.checked ? 'block' : 'none';
+        }
+        if (bannerToggle) bannerToggle.addEventListener('change', syncBanner);
+        if (retryBtn) {
+          retryBtn.addEventListener('click', function () {
+            if (resultIf) resultIf.textContent = 'retried';
+          });
+        }
+
+        // Row buttons — set the matching result span to "done" on click.
+        document.querySelectorAll('.branch-row-btn').forEach(function (b) {
+          b.addEventListener('click', function () {
+            var id = b.getAttribute('data-id');
+            var r = document.querySelector(
+              '.branch-row-result[data-id="' + id + '"]',
+            );
+            if (r) r.textContent = 'done';
+          });
+        });
+
+        /**
+         * Reset both widgets to initial state. Optional `{ banner: true }`
+         * forces the banner ON; otherwise leaves the toggle alone.
+         * Each cookbook scenario calls this first so the demo is repeatable.
+         */
+        window.__resetBranchingDemo = function (opts) {
+          opts = opts || {};
+          if (opts.banner === true && bannerToggle) {
+            bannerToggle.checked = true;
+            syncBanner();
+          } else if (opts.banner === false && bannerToggle) {
+            bannerToggle.checked = false;
+            syncBanner();
+          }
+          if (resultIf) resultIf.textContent = 'unset';
+          document.querySelectorAll('.branch-row-result').forEach(function (r) {
+            r.textContent = 'pending';
+          });
+          return 'reset';
+        };
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
   <!-- ============ REAL-WORLD EXAMPLES (external sites) =================== -->
   <!-- ===================================================================== -->
   <section style="background:#fffbe6;border-color:#d6b656">

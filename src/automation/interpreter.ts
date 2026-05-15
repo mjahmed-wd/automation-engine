@@ -82,6 +82,37 @@ export async function runStepWithRetry(
   throw lastErr;
 }
 
+/**
+ * Walk an array of steps and dispatch each via the action registry.
+ * Exported so the `if` and `forEach` action handlers (Batch 4) can call it
+ * recursively on their nested `then` / `else` / `do` step arrays — same
+ * dispatch loop, same retry policy, same logging conventions, no
+ * special-casing in the main run flow.
+ *
+ * `labelPrefix` (optional) prefixes the per-step log lines so nested step
+ * arrays are distinguishable in the side panel. Top-level uses "" (yields
+ * "Step 1/N: ..."); nested calls pass "  " or similar.
+ */
+export async function runStepArray(
+  steps: AutomationStep[],
+  ctx: ExecutionContext,
+  page: Page,
+  labelPrefix = '',
+): Promise<void> {
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const handler = resolveAction(step.action);
+    if (!handler) {
+      throw new Error(`Unknown action "${step.action}" at step ${i + 1}`);
+    }
+    ctx.log(
+      'info',
+      `${labelPrefix}→ Step ${i + 1}/${steps.length}: ${step.action}`,
+    );
+    await runStepWithRetry(step, ctx, page, handler);
+  }
+}
+
 export async function runScript(
   script: AutomationScript,
   ctx: ExecutionContext,
@@ -97,15 +128,7 @@ export async function runScript(
     `Running "${script.name}" (${script.steps.length} step${script.steps.length === 1 ? '' : 's'})…`,
   );
 
-  for (let i = 0; i < script.steps.length; i++) {
-    const step = script.steps[i];
-    const handler = resolveAction(step.action);
-    if (!handler) {
-      throw new Error(`Unknown action "${step.action}" at step ${i + 1}`);
-    }
-    ctx.log('info', `→ Step ${i + 1}/${script.steps.length}: ${step.action}`);
-    await runStepWithRetry(step, ctx, page, handler);
-  }
+  await runStepArray(script.steps, ctx, page);
 
   ctx.log('success', `Finished "${script.name}".`);
   return ctx;

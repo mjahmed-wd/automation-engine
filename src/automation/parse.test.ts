@@ -508,6 +508,137 @@ describe('validator: waitForResponse (Batch 3)', () => {
   });
 });
 
+describe('validator: if step (Batch 4)', () => {
+  it('requires xpathExists', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "if", "timeoutMs": 1000, "then": [] }`),
+    ).toThrow(/if requires "xpathExists"/);
+  });
+
+  it('requires then', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "if", "xpathExists": "//x", "timeoutMs": 1000 }`,
+      ),
+    ).toThrow(/if requires "then"/);
+  });
+
+  it('requires timeoutMs or wait:false (rejects neither)', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "if", "xpathExists": "//x", "then": [] }`),
+    ).toThrow(/requires either "timeoutMs".*or "wait": false/);
+  });
+
+  it('accepts timeoutMs-only spec', () => {
+    const out = parseAutomation(
+      `{ "action": "if", "xpathExists": "//x", "timeoutMs": 1000, "then": [] }`,
+    );
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('accepts wait:false instant-check spec', () => {
+    const out = parseAutomation(
+      `{ "action": "if", "xpathExists": "//x", "wait": false, "then": [] }`,
+    );
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('rejects wait:true (only literal false allowed)', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "if", "xpathExists": "//x", "wait": true, "then": [] }`,
+      ),
+    ).toThrow(/wait may only be set to literal false/);
+  });
+
+  it('accepts else array', () => {
+    const out = parseAutomation(`{
+      "action": "if", "xpathExists": "//x", "timeoutMs": 500,
+      "then": [{ "action": "wait", "ms": 100 }],
+      "else": [{ "action": "wait", "ms": 200 }]
+    }`);
+    expect(out.steps).toHaveLength(1);
+  });
+});
+
+describe('validator: forEach step (Batch 4)', () => {
+  it('requires as', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "forEach", "items": ["a"], "do": [] }`),
+    ).toThrow(/forEach requires "as"/);
+  });
+
+  it('requires items', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "forEach", "as": "x", "do": [] }`),
+    ).toThrow(/forEach requires "items"/);
+  });
+
+  it('requires do array', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "forEach", "as": "x", "items": ["a"] }`),
+    ).toThrow(/forEach requires "do"/);
+  });
+
+  it('accepts items as string', () => {
+    const out = parseAutomation(
+      `{ "action": "forEach", "as": "x", "items": "a,b,c", "do": [] }`,
+    );
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('accepts items as array', () => {
+    const out = parseAutomation(
+      `{ "action": "forEach", "as": "x", "items": ["a","b"], "do": [] }`,
+    );
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('rejects items array with non-string entry', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "forEach", "as": "x", "items": ["a", 42], "do": [] }`,
+      ),
+    ).toThrow(/items\[1\] must be a string/);
+  });
+});
+
+describe('validator: nested step arrays (Batch 4)', () => {
+  it('recurses into if.then and catches nested invalid steps', () => {
+    expect(() =>
+      parseAutomation(`{
+        "action": "if", "xpathExists": "//x", "timeoutMs": 500,
+        "then": [
+          { "action": "fill", "xpath": "//y" }
+        ]
+      }`),
+    ).toThrow(/if\.then.*fill requires "value"/);
+  });
+
+  it('recurses into forEach.do and catches nested invalid steps', () => {
+    expect(() =>
+      parseAutomation(`{
+        "action": "forEach", "as": "i", "items": ["a"],
+        "do": [
+          { "action": "click" }
+        ]
+      }`),
+    ).toThrow(/forEach\.do.*click requires "xpath"/);
+  });
+
+  it('catches deep nesting beyond max depth (20)', () => {
+    // Build a 21-level-deep nesting of if-then-if-then-...
+    let json = '{ "action": "wait", "ms": 1 }';
+    for (let i = 0; i < 21; i++) {
+      json = `{
+        "action": "if", "xpathExists": "//x", "wait": false,
+        "then": [${json}]
+      }`;
+    }
+    expect(() => parseAutomation(json)).toThrow(/exceeded max depth 20/);
+  });
+});
+
 describe('registry consistency: stepValidators vs actions/index.ts', () => {
   it('every registered action has a validator', () => {
     for (const name of Object.keys(actions)) {

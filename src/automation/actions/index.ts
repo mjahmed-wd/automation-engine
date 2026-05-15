@@ -22,6 +22,8 @@ import { dialogAction } from './dialog';
 import { describeAction } from './describe';
 import { tabAction } from './tab';
 import { waitForResponseAction } from './waitForResponse';
+import { ifAction } from './if';
+import { forEachAction } from './forEach';
 
 export type ActionHandler = (
   step: any,
@@ -45,6 +47,8 @@ export const actions: Record<AutomationStep['action'], ActionHandler> = {
   describe: describeAction,
   tab: tabAction,
   waitForResponse: waitForResponseAction,
+  if: ifAction,
+  forEach: forEachAction,
 };
 
 export function resolveAction(name: string): ActionHandler | undefined {

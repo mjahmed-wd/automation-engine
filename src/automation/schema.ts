@@ -419,6 +419,79 @@ export interface WaitForResponseStep extends BaseStep, RetryFields {
   saveBody?: string;
 }
 
+/**
+ * Conditional branching (Batch 4). `xpathExists` is checked against the
+ * current page; if it matches, the `then` step array runs, otherwise `else`
+ * (if present) runs. Empty / missing `else` is a no-op on the else path.
+ *
+ * Timing — required, no defaults:
+ *   - `timeoutMs: N`     — poll the page for up to N ms looking for the
+ *                          xpath. Reliable but pays the wait on the else path.
+ *   - `wait: false`      — instant DOM check, no polling. Cheap but flaky
+ *                          if the element renders asynchronously.
+ *
+ * The validator rejects an `if` step that has neither. Forcing the choice
+ * keeps scripts self-documenting (you can read the intent from the spec)
+ * and avoids surprising default behavior.
+ *
+ *   { "action": "if", "xpathExists": "//div[@class='error-banner']",
+ *     "timeoutMs": 1000,
+ *     "then": [ { "action": "click", "xpath": "//button[.='Retry']" } ],
+ *     "else": [ { "action": "wait", "ms": 100 } ] }
+ *
+ * `then` and `else` can contain any AutomationStep, including more `if`
+ * and `forEach` — the interpreter's runStepArray is recursive. The
+ * validator caps nesting at 20 levels deep to catch buggy generators.
+ */
+export interface IfStep extends BaseStep {
+  action: 'if';
+  xpathExists: string;
+  /** Poll the page for the xpath for up to this many ms. Required unless
+   *  `wait: false` is set. */
+  timeoutMs?: number;
+  /** Instant DOM check, no polling. Required unless `timeoutMs` is set. */
+  wait?: false;
+  then: AutomationStep[];
+  else?: AutomationStep[];
+}
+
+/**
+ * Iterate over a list of items (Batch 4). Runs the `do` step array once per
+ * item, exposing the current item as `ctx.variables[as]` for `{{var}}`
+ * substitution inside the loop body.
+ *
+ * `items` accepts two shapes:
+ *   - **String** — JSON5 string; resolved via `substituteRaw` (so it can
+ *     reference a previous step's `saveAs` output), then split on `,` and
+ *     each entry trimmed. Use this for "process this comma-separated list".
+ *   - **JSON array of strings** — `["a", "b", "c"]` literal. Use this for
+ *     small known-up-front lists.
+ *
+ * After the loop, `ctx.variables[as]` is removed so substitution outside
+ * the loop doesn't see a stale value.
+ *
+ * Caveat: `saveAs` outputs from inside the loop COLLIDE across iterations
+ * (last write wins). Most workflows don't need per-iteration outputs;
+ * for those that do, save into the page DOM and read all values after.
+ *
+ *   { "action": "forEach",
+ *     "items": ["C-1001", "C-1002", "C-1003"],
+ *     "as": "id",
+ *     "do": [
+ *       { "action": "tab", "op": "open", "url": "/customers/{{id}}/edit" },
+ *       { "action": "fill", "xpath": "//textarea[@name='note']",
+ *         "value": "Processed {{id}}" },
+ *       { "action": "click", "xpath": "//button[.='Save']" },
+ *       { "action": "tab", "op": "close" }
+ *     ] }
+ */
+export interface ForEachStep extends BaseStep {
+  action: 'forEach';
+  items: string | string[];
+  as: string;
+  do: AutomationStep[];
+}
+
 export type AutomationStep =
   | GotoStep
   | FillStep
@@ -434,7 +507,9 @@ export type AutomationStep =
   | DialogStep
   | DescribeStep
   | TabStep
-  | WaitForResponseStep;
+  | WaitForResponseStep
+  | IfStep
+  | ForEachStep;
 
 /** Tag identifies which sidepanel tab a script's example belongs in. */
 export type AutomationTag = 'action' | 'get';
