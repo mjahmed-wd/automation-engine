@@ -7,7 +7,7 @@ export default defineConfig({
     name: 'Automation Engine',
     description:
       'JSON-driven web automation runner — drives the active tab via Chrome DevTools Protocol',
-    permissions: ['sidePanel', 'tabs', 'debugger'],
+    permissions: ['sidePanel', 'tabs', 'debugger', 'storage'],
     host_permissions: ['<all_urls>'],
     action: {
       default_title: 'Open Automation Engine sidebar',
