@@ -228,6 +228,76 @@ describe('validator: step index correctness', () => {
   });
 });
 
+describe('validator: tab step', () => {
+  it('rejects unknown op', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "tab", "op": "jumpTo" }`),
+    ).toThrow(/tab requires "op"/);
+  });
+
+  it('rejects missing op', () => {
+    expect(() => parseAutomation(`{ "action": "tab" }`)).toThrow(/tab requires "op"/);
+  });
+
+  it('open requires url', () => {
+    expect(() => parseAutomation(`{ "action": "tab", "op": "open" }`)).toThrow(
+      /tab\.open requires "url"/,
+    );
+  });
+
+  it('open accepts url + waitForXPath', () => {
+    const out = parseAutomation(
+      `{ "action": "tab", "op": "open", "url": "https://example.com", "waitForXPath": "//h1" }`,
+    );
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('switchTo requires urlMatches or index', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "tab", "op": "switchTo" }`),
+    ).toThrow(/requires "urlMatches" or "index"/);
+  });
+
+  it('switchTo rejects both urlMatches and index', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "tab", "op": "switchTo", "urlMatches": "/x/", "index": 0 }`,
+      ),
+    ).toThrow(/provide exactly one of "urlMatches" or "index"/);
+  });
+
+  it('switchTo rejects non-integer index', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "tab", "op": "switchTo", "index": 1.5 }`),
+    ).toThrow(/index must be a non-negative integer/);
+  });
+
+  it('switchTo rejects negative index', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "tab", "op": "switchTo", "index": -1 }`),
+    ).toThrow(/index must be a non-negative integer/);
+  });
+
+  it('waitForNew accepts bare op', () => {
+    const out = parseAutomation(`{ "action": "tab", "op": "waitForNew" }`);
+    expect(out.steps).toHaveLength(1);
+  });
+
+  it('waitForNew rejects non-number timeoutMs', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "tab", "op": "waitForNew", "timeoutMs": "5s" }`,
+      ),
+    ).toThrow(/timeoutMs must be a number/);
+  });
+
+  it('close / next / previous accept bare op', () => {
+    expect(parseAutomation(`{ "action": "tab", "op": "close" }`).steps).toHaveLength(1);
+    expect(parseAutomation(`{ "action": "tab", "op": "next" }`).steps).toHaveLength(1);
+    expect(parseAutomation(`{ "action": "tab", "op": "previous" }`).steps).toHaveLength(1);
+  });
+});
+
 describe('registry consistency: stepValidators vs actions/index.ts', () => {
   it('every registered action has a validator', () => {
     for (const name of Object.keys(actions)) {

@@ -272,6 +272,52 @@ export interface EvaluateStep extends BaseStep {
   timeoutMs?: number;
 }
 
+/**
+ * Multi-tab orchestration. CRM-style flows often pivot through new tabs:
+ * click a row → detail opens in new tab → fill → close → repeat. Today the
+ * engine is bound to one `tabId` for the lifetime of the run; this step
+ * lets a script open, switch between, and close tabs.
+ *
+ * Ops:
+ *   - `open`        — proactively open a new tab at `url` (engine-initiated).
+ *                     Pairs with `waitForXPath` / `waitForTimeoutMs` for the
+ *                     same SPA-aware wait as `goto`.
+ *   - `switchTo`    — focus a tab matching `urlMatches` (substring or
+ *                     `/regex/flags`) or `index` (0-based, within the window).
+ *                     Exactly one of `urlMatches` or `index` must be supplied.
+ *   - `waitForNew`  — wait for a new tab opened by the previous step's side
+ *                     effect (e.g., `click` on a `target="_blank"` link).
+ *                     Optional `urlMatches` to disambiguate.
+ *   - `close`       — close the current tab and pop back to the previous one.
+ *                     The engine maintains an internal origin stack: every
+ *                     `open` / `switchTo` / `waitForNew` pushes the prior tab;
+ *                     `close` pops + reactivates whatever's on top. Nested
+ *                     side-tabs (A opens B inside A) close in the right order.
+ *   - `next`/`previous` — cycle to the adjacent tab in the same window.
+ *
+ *   { "action": "tab", "op": "open", "url": "https://lookup.internal/sku/{{sku}}",
+ *     "waitForXPath": "//span[@id='price']" }
+ *   { "action": "tab", "op": "waitForNew", "urlMatches": "/customers/" }
+ *   { "action": "tab", "op": "close" }
+ */
+export interface TabStep extends BaseStep {
+  action: 'tab';
+  op: 'open' | 'switchTo' | 'waitForNew' | 'close' | 'next' | 'previous';
+  /** For `open`: the URL to navigate the new tab to. Supports `{{var}}`. */
+  url?: string;
+  /** For `open`: optional xpath to wait for after the tab signals 'complete'. */
+  waitForXPath?: string;
+  /** For `open`: override for the post-load waitFor timeout (default 20s). */
+  waitForTimeoutMs?: number;
+  /** For `switchTo` / `waitForNew`: URL pattern to match. Plain string is a
+   *  substring match; `/regex/flags` is a RegExp. Supports `{{var}}`. */
+  urlMatches?: string;
+  /** For `switchTo`: 0-based index in the window's tab strip. Mutex with `urlMatches`. */
+  index?: number;
+  /** For `waitForNew`: how long to wait for the new tab to appear. Default 10s. */
+  timeoutMs?: number;
+}
+
 export type AutomationStep =
   | GotoStep
   | FillStep
@@ -285,7 +331,8 @@ export type AutomationStep =
   | SelectOptionStep
   | HoverStep
   | DialogStep
-  | DescribeStep;
+  | DescribeStep
+  | TabStep;
 
 /** Tag identifies which sidepanel tab a script's example belongs in. */
 export type AutomationTag = 'action' | 'get';

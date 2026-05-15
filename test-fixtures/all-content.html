@@ -830,6 +830,188 @@
   </section>
 
   <!-- ===================================================================== -->
+  <section id="multi-tab-host">
+    <h2>21. Multi-tab orchestration <span class="tag">tab open / waitForNew / close</span></h2>
+    <p class="use-case">CRM-style flows pivot through new tabs: click a row → detail opens in a new tab → fill → close → back to the list. The two widgets below cover both directions. The "Open detail" button uses <code>target="_blank"</code> so the script can <code>tab waitForNew</code>; the second block proves the script can also proactively <code>tab open</code> a side-tab to look something up. The same fixture file serves both source and target — open with hash <code>#detail</code> to see the detail widget rendered.</p>
+
+    <div class="widget">
+      <!--
+        Why a button instead of <a href="#detail" target="_blank">: Chrome's
+        popup blocker is stricter on file:// origins than http(s). A trusted
+        click on a target="_blank" link gets silently swallowed; window.open
+        invoked synchronously inside the click handler reliably opens a tab.
+      -->
+      <button type="button" id="open-detail-link">Open detail in new tab</button>
+      <p class="result" id="result-multi-tab">waiting</p>
+    </div>
+
+    <div id="detail-widget" style="margin-top: 12px; display: none; padding: 10px; border: 1px dashed #999; background: #fafff0;">
+      <strong>Detail view</strong> — shown only when the URL hash is <code>#detail</code>.
+      <div class="widget" style="margin-top: 6px;">
+        <input id="detail-input" type="text" placeholder="reads back into the opener">
+        <button id="detail-save" type="button">Save</button>
+        <p class="result" id="detail-result">unsaved</p>
+      </div>
+    </div>
+
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Multi-tab: page-triggered new tab",
+  "tag": "action",
+  "steps": [
+    { "action": "click", "xpath": "//a[@id='open-detail-link']" },
+    { "action": "tab",   "op": "waitForNew", "urlMatches": "#detail", "timeoutMs": 10000 },
+    { "action": "fill",  "xpath": "//input[@id='detail-input']", "value": "from-script" },
+    { "action": "click", "xpath": "//button[@id='detail-save']" },
+    { "action": "get",   "xpath": "//p[@id='detail-result']", "property": "textContent", "saveAs": "detail" },
+    { "action": "tab",   "op": "close" },
+    { "action": "get",   "xpath": "//p[@id='result-multi-tab']", "property": "textContent", "saveAs": "back" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> a new tab opens at <code>#detail</code>, the script fills and saves there, then the new tab closes and focus returns to this page. <code>detail</code> output should be <code>saved: from-script</code>. <code>back</code> output starts as <code>waiting</code> and changes to <code>got: from-script</code> once the opener-side listener receives the postMessage.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Multi-tab: script-triggered side tab",
+  "tag": "action",
+  "steps": [
+    { "action": "tab",  "op": "open", "url": "{{detailUrl}}", "waitForXPath": "//input[@id='detail-input']" },
+    { "action": "fill", "xpath": "//input[@id='detail-input']", "value": "side-tab-value" },
+    { "action": "get",  "xpath": "//input[@id='detail-input']", "property": "value", "saveAs": "lookup" },
+    { "action": "tab",  "op": "close" }
+  ],
+  "variables": {
+    "detailUrl": "REPLACE_WITH_FIXTURE_URL#detail"
+  }
+}</pre>
+        <p class="expected"><strong>Expected:</strong> a brand-new tab opens at the URL in <code>detailUrl</code>, the script fills the detail input, reads it back into <code>lookup</code>, and closes the tab. Focus returns to whichever tab was active when <code>tab open</code> ran. Replace <code>REPLACE_WITH_FIXTURE_URL</code> with the absolute file:// URL of this fixture.</p>
+      </div>
+    </div>
+
+    <script>
+      // Show the detail widget only when the hash matches. Lets the same fixture
+      // file serve as both the source (no hash) and the target (#detail).
+      (function () {
+        // Opener-side: open the detail tab via window.open inside the click
+        // handler. The synchronous-within-user-gesture path is what the popup
+        // blocker actually trusts, especially on file:// origins.
+        var openBtn = document.getElementById('open-detail-link');
+        if (openBtn) {
+          openBtn.addEventListener('click', function () {
+            var base = location.href.replace(/#.*$/, '');
+            window.open(base + '#detail', '_blank');
+          });
+        }
+
+        var detail = document.getElementById('detail-widget');
+        function syncHash() {
+          detail.style.display = location.hash === '#detail' ? 'block' : 'none';
+        }
+        syncHash();
+        window.addEventListener('hashchange', syncHash);
+
+        var saveBtn = document.getElementById('detail-save');
+        if (saveBtn) {
+          saveBtn.addEventListener('click', function () {
+            var v = document.getElementById('detail-input').value;
+            document.getElementById('detail-result').textContent = 'saved: ' + v;
+            // Push the value back to the opener so the opener-side script can
+            // verify "we made it back" without needing storage.
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({ kind: 'detail-saved', value: v }, '*');
+              }
+            } catch (e) {}
+          });
+        }
+
+        // Opener side: listen for the postMessage from the detail tab and
+        // reflect it into the result paragraph. Lives in the same script so
+        // it's a no-op on the detail tab itself (the element isn't present).
+        var result = document.getElementById('result-multi-tab');
+        if (result) {
+          window.addEventListener('message', function (e) {
+            var d = e && e.data;
+            if (d && d.kind === 'detail-saved') {
+              result.textContent = 'got: ' + d.value;
+            }
+          });
+        }
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section>
+    <h2>22. DOM injection via <code>evaluate</code> <span class="tag">evaluate</span></h2>
+    <p class="use-case">The <code>evaluate</code> action runs your expression in the page's <strong>main JS world</strong> via CDP <code>Runtime.evaluate</code> — same realm as the page's own inline <code>&lt;script&gt;</code> tags. Anything you can do in DevTools Console, you can do here: append elements, inject stylesheets, delete nodes, rewrite text, call the page's globals (Redux store, jQuery, framework hooks). The page can't tell whether the mutation came from its own scripts or from outside. This is the escape hatch for "make a one-off change while the automation runs" — for example dimming rows you've already processed in a CRM list, hiding noisy UI, or surfacing a custom progress badge.</p>
+    <p class="use-case">Multi-statement code needs an IIFE because <code>Runtime.evaluate</code> runs in script mode and doesn't return the last expression — write <code>(() =&gt; { …; return value; })()</code>. Return values get JSON-serialized, so primitives and plain objects survive into <code>ctx.outputs</code> via <code>saveAs</code>; DOM nodes come back as <code>{}</code>. Mutations persist until the next navigation or reload.</p>
+    <div class="widget">
+      <div id="injection-playground" style="padding: 10px; border: 1px dashed #999; background: #fafff0; min-height: 40px;">
+        <em>Injection playground</em> — scenarios below append, modify, or delete content in or around this box. Reload the page to reset.
+      </div>
+      <p class="result" id="result-injection">no injection yet</p>
+    </div>
+    <div class="scenarios">
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Inject: add a floating button",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "(() => { const b = document.createElement('button'); b.id = 'injected-btn'; b.textContent = 'Injected!'; b.style.cssText = 'position:fixed;bottom:20px;right:20px;padding:10px 16px;background:#06c;color:white;border:none;border-radius:4px;font-size:14px;cursor:pointer;z-index:9999'; b.onclick = () => { document.getElementById('result-injection').textContent = 'button clicked at ' + new Date().toLocaleTimeString(); }; document.body.appendChild(b); return 'added'; })()", "saveAs": "result" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> a blue "Injected!" button appears fixed in the bottom-right corner of the page. Output: <code>result = "added"</code>. Click the button manually to confirm its onClick fires — the result paragraph updates with the current time. Reload the page to remove the button.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Inject: dark-mode the fixture (and undo)",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "(() => { const s = document.createElement('style'); s.id = 'dark-mode-injection'; s.textContent = 'html, body { background: #1a1a1a !important; color: #ddd !important; } section { background: #2a2a2a !important; border-color: #444 !important; } input, select, textarea, button { background: #333 !important; color: #ddd !important; border-color: #555 !important; }'; document.head.appendChild(s); return 'darkened'; })()", "saveAs": "applied" },
+    { "action": "wait", "ms": 2000 },
+    { "action": "evaluate", "expression": "(() => { document.getElementById('dark-mode-injection')?.remove(); return 'restored'; })()", "saveAs": "undone" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> the page flips to dark mode for 2 seconds, then back to light. Outputs: <code>applied = "darkened"</code>, <code>undone = "restored"</code>. Proves that style injection is reversible by id.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Inject: delete section 1",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "(() => { const heads = Array.from(document.querySelectorAll('h2')); const target = heads.find(h => h.textContent.includes('1. Plain text input')); const section = target && target.closest('section'); if (section) { section.remove(); return 'deleted'; } return 'not-found'; })()", "saveAs": "result" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> Section 1 (the plain-text-input demo at the top of the page) disappears entirely. Output: <code>result = "deleted"</code>. Reload to restore. Pattern is useful for "hide noisy sections of an app's UI before screenshotting".</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Inject: rewrite text + read page globals",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "(() => { const n = document.querySelectorAll('h2').length; document.querySelectorAll('h2').forEach((h, i) => { h.firstChild.textContent = '🎯 Section ' + (i+1) + '/' + n + ' '; }); return { renamed: n, title: document.title, url: location.href }; })()", "saveAs": "info" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> every section header on the page gets renamed to "🎯 Section N/total". Output: <code>info</code> is the JSON-stringified object <code>{"renamed":20,"title":"Automation fixture — all content","url":"file:///..."}</code> — proves the expression can both mutate the DOM and pull values out of the page's globals (<code>document.title</code>, <code>location.href</code>) in one call.</p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
   <!-- ============ REAL-WORLD EXAMPLES (external sites) =================== -->
   <!-- ===================================================================== -->
   <section style="background:#fffbe6;border-color:#d6b656">

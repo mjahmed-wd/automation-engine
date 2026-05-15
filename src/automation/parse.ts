@@ -192,6 +192,42 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: describe.saveAs must be a string.`;
     return null;
   },
+  tab: (s, n) => {
+    const KNOWN_OPS = ['open', 'switchTo', 'waitForNew', 'close', 'next', 'previous'];
+    if (!isString(s.op) || !KNOWN_OPS.includes(s.op))
+      return `Step ${n}: tab requires "op" (one of ${KNOWN_OPS.join(', ')}).`;
+
+    if (s.op === 'open') {
+      if (!isString(s.url))
+        return `Step ${n}: tab.open requires "url" (string).`;
+      if (s.waitForXPath !== undefined && !isString(s.waitForXPath))
+        return `Step ${n}: tab.open.waitForXPath must be a string.`;
+      if (s.waitForTimeoutMs !== undefined && !isNumber(s.waitForTimeoutMs))
+        return `Step ${n}: tab.open.waitForTimeoutMs must be a number.`;
+    }
+
+    if (s.op === 'switchTo') {
+      const hasUrl = s.urlMatches !== undefined && s.urlMatches !== null;
+      const hasIndex = s.index !== undefined && s.index !== null;
+      if (!hasUrl && !hasIndex)
+        return `Step ${n}: tab.switchTo requires "urlMatches" or "index".`;
+      if (hasUrl && hasIndex)
+        return `Step ${n}: tab.switchTo: provide exactly one of "urlMatches" or "index", not both.`;
+      if (hasUrl && !isString(s.urlMatches))
+        return `Step ${n}: tab.switchTo.urlMatches must be a string.`;
+      if (hasIndex && (!isNumber(s.index) || s.index < 0 || !Number.isInteger(s.index)))
+        return `Step ${n}: tab.switchTo.index must be a non-negative integer.`;
+    }
+
+    if (s.op === 'waitForNew') {
+      if (s.urlMatches !== undefined && !isString(s.urlMatches))
+        return `Step ${n}: tab.waitForNew.urlMatches must be a string.`;
+      if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
+        return `Step ${n}: tab.waitForNew.timeoutMs must be a number.`;
+    }
+
+    return null;
+  },
 };
 
 function validateScript(script: AutomationScript): void {

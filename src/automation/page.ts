@@ -35,12 +35,32 @@ import {
   type GetOptions,
   type Mode,
 } from './locator';
+import { parseUrlMatcher, waitForNewTabMatching, waitForTabComplete } from './tabs';
 
 type Target = chrome.debugger.Debuggee;
 
 const PROTOCOL_VERSION = '1.3';
 const DEFAULT_SEARCH_TIMEOUT_MS = 20_000;
 const CHILD_CMD_TIMEOUT_MS = 10_000;
+
+/**
+ * Per-tab CDP state. We hold one of these per attached tab so multi-tab
+ * orchestration (open side tab → look up → close → come back) doesn't pay
+ * a fresh attach round-trip when the script returns to a tab we've already
+ * been on. Existing single-tab logic reads through the `current` getter and
+ * doesn't need to know the map exists.
+ */
+interface TabAttachment {
+  target: Target;
+  childSessions: Map<string, any>;
+  cdpReadyChildren: Set<string>;
+  hasClosedShadow: boolean;
+  /**
+   * One-shot response for the next native dialog on this tab. Scoped per-tab
+   * because a `dialog` arming on tab A shouldn't fire for tab B's confirm.
+   */
+  nextDialogResponse: { accept: boolean; promptText: string } | null;
+}
 
 export interface FrameResult {
   ok: boolean;
@@ -96,30 +116,30 @@ export class FatalActionError extends Error {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class Page {
-  readonly tabId: number;
-  private readonly tabTarget: Target;
+  readonly windowId: number | undefined;
   private readonly log: LogFn;
-  private readonly childSessions = new Map<string, any>();
+  /**
+   * Every tab we've ever attached the debugger to during this run. We don't
+   * detach on tab switch — that costs ~1s of attach setup to re-enter. Instead
+   * we keep all sessions live and flip `currentTabId` to point at the active
+   * one. Detached only on script end via `detach()`.
+   */
+  private readonly attachments = new Map<number, TabAttachment>();
+  /**
+   * Origin stack for `tab close`. Every op that activates a different tab
+   * pushes the previously-current tabId; `close` pops and reactivates. Empty
+   * stack at close → focus falls to whatever Chrome decides (typically the
+   * adjacent tab in the strip).
+   */
+  private readonly originStack: number[] = [];
   private readonly pending = new Map<
     number,
     { resolve: (v: any) => void; reject: (e: Error) => void }
   >();
-  private readonly cdpReadyChildren = new Set<string>();
-  /**
-   * Auto-detected at attach + after each DOM-mutating action. When `true`,
-   * `runAction` and `click` skip the fast path (which can't see into closed
-   * shadow roots) and go straight to CDP. Users can override with
-   * `pierceClosed: true` (force CDP) or `pierceClosed: false` (force fast path).
-   */
-  private hasClosedShadow = false;
-  /**
-   * One-shot response for the next native dialog (`alert` / `confirm` /
-   * `prompt`). Set by `setNextDialogResponse`, consumed by `onEvent` when
-   * `Page.javascriptDialogOpening` arrives. `null` means "use default
-   * auto-accept with empty prompt" — that default prevents scripts from
-   * hanging on a stray `confirm("Are you sure?")` they didn't expect.
-   */
-  private nextDialogResponse: { accept: boolean; promptText: string } | null = null;
+  /** Active tab pointer. All `this.tabTarget` / `this.childSessions` /
+   *  `this.hasClosedShadow` / `this.nextDialogResponse` reads route through
+   *  the attachment for THIS tabId. */
+  private currentTabId!: number;
   private nextMsgId = 1;
   private listener?: (
     source: chrome.debugger.Debuggee,
@@ -128,45 +148,138 @@ export class Page {
   ) => void;
   private detached = false;
 
-  private constructor(tabId: number, log: LogFn) {
-    this.tabId = tabId;
-    this.tabTarget = { tabId };
+  /** Public view of the active tab. Getter (not field) because it changes
+   *  when the script does `tab switchTo` / `tab open` / `tab close`. */
+  get tabId(): number {
+    return this.currentTabId;
+  }
+
+  /**
+   * Backing accessor for per-tab state. Existing code that does
+   * `this.tabTarget` / `this.hasClosedShadow` / `this.childSessions` /
+   * `this.cdpReadyChildren` / `this.nextDialogResponse` reads through this
+   * implicitly — the getters/setters below forward to whichever attachment
+   * is currently active. The dozens of `this.tabTarget` call sites elsewhere
+   * in this file work unchanged.
+   */
+  private get attachment(): TabAttachment {
+    const a = this.attachments.get(this.currentTabId);
+    if (!a) {
+      throw new Error(
+        `Page: internal — no attachment for current tab ${this.currentTabId}.`,
+      );
+    }
+    return a;
+  }
+  private get tabTarget(): Target {
+    return this.attachment.target;
+  }
+  private get childSessions(): Map<string, any> {
+    return this.attachment.childSessions;
+  }
+  private get cdpReadyChildren(): Set<string> {
+    return this.attachment.cdpReadyChildren;
+  }
+  private get hasClosedShadow(): boolean {
+    return this.attachment.hasClosedShadow;
+  }
+  private set hasClosedShadow(v: boolean) {
+    this.attachment.hasClosedShadow = v;
+  }
+  private get nextDialogResponse(): { accept: boolean; promptText: string } | null {
+    return this.attachment.nextDialogResponse;
+  }
+  private set nextDialogResponse(
+    v: { accept: boolean; promptText: string } | null,
+  ) {
+    this.attachment.nextDialogResponse = v;
+  }
+
+  private constructor(tabId: number, windowId: number | undefined, log: LogFn) {
+    this.currentTabId = tabId;
+    this.windowId = windowId;
     this.log = log;
   }
 
-  static async create(tabId: number, log: LogFn): Promise<Page> {
-    const page = new Page(tabId, log);
+  static async create(
+    tabId: number,
+    windowId: number | undefined,
+    log: LogFn,
+  ): Promise<Page> {
+    const page = new Page(tabId, windowId, log);
     await page.init();
     return page;
   }
 
   private async init() {
-    this.log('info', 'Attaching debugger to tab…');
-    await this.attach(this.tabTarget);
-
+    // Listener is registered once for the lifetime of this Page and routes
+    // events to the attachment for whichever source.tabId fired them. That
+    // way a second tab we attach to later doesn't need its own listener;
+    // we just need its tabId to be in `this.attachments`.
     this.listener = (source, method, params) => {
-      if (source.tabId !== this.tabId) return;
-      this.onEvent(method, params);
+      if (source.tabId === undefined) return;
+      if (!this.attachments.has(source.tabId)) return;
+      this.onEvent(source.tabId, method, params);
     };
     chrome.debugger.onEvent.addListener(this.listener);
 
-    await this.sendCmd(this.tabTarget, 'Runtime.enable');
-    await this.sendCmd(this.tabTarget, 'DOM.enable').catch(() => {});
-    // Required to receive Page.javascriptDialogOpening events. Without
-    // Page.enable, native alert()/confirm()/prompt() would block the page
-    // indefinitely and stall the run loop.
-    await this.sendCmd(this.tabTarget, 'Page.enable').catch(() => {});
-    await this.sendCmd(this.tabTarget, 'Target.setAutoAttach', {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: false,
-    });
+    await this.attachTab(this.currentTabId);
+  }
 
-    await sleep(800);
+  /**
+   * Attach the debugger to `tabId`, register a fresh `TabAttachment`, enable
+   * Runtime/DOM/Page + auto-attach for sub-targets, and run the closed-shadow
+   * detect. Used both by `init` for the initial tab and by `openTab` /
+   * `switchToTab` / `waitForNewTab` to bring up additional tabs.
+   *
+   * Idempotent: if `tabId` is already attached, just flips `currentTabId` and
+   * returns. Same-tab re-attach would otherwise fail with "Another debugger
+   * is already attached" anyway.
+   */
+  private async attachTab(tabId: number): Promise<void> {
+    if (this.attachments.has(tabId)) {
+      this.currentTabId = tabId;
+      return;
+    }
+    const target: Target = { tabId };
+    const attachment: TabAttachment = {
+      target,
+      childSessions: new Map(),
+      cdpReadyChildren: new Set(),
+      hasClosedShadow: false,
+      nextDialogResponse: null,
+    };
+    // Register BEFORE attaching so the event listener can route any events
+    // that fire during attach (Target.attachedToTarget for pre-existing
+    // iframes arrives almost immediately after setAutoAttach).
+    this.attachments.set(tabId, attachment);
+    this.currentTabId = tabId;
 
-    // Initial closed-shadow detection so we can skip the fast path on pages
-    // like Shepherd that mount closed shadow at load time.
-    await this.detectClosedShadow();
+    this.log('info', `Attaching debugger to tab ${tabId}…`);
+    try {
+      await this.attach(target);
+      await this.sendCmd(target, 'Runtime.enable');
+      await this.sendCmd(target, 'DOM.enable').catch(() => {});
+      // Required to receive Page.javascriptDialogOpening events. Without
+      // Page.enable, native alert()/confirm()/prompt() would block the page
+      // indefinitely and stall the run loop.
+      await this.sendCmd(target, 'Page.enable').catch(() => {});
+      await this.sendCmd(target, 'Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: false,
+      });
+
+      await sleep(800);
+
+      // Initial closed-shadow detection so we can skip the fast path on pages
+      // like Shepherd that mount closed shadow at load time.
+      await this.detectClosedShadow();
+    } catch (err) {
+      // Don't leak a half-initialized attachment on failure.
+      this.attachments.delete(tabId);
+      throw err;
+    }
   }
 
   /**
@@ -197,20 +310,28 @@ export class Page {
     }
   }
 
-  private onEvent(method: string, params: any) {
+  private onEvent(sourceTabId: number, method: string, params: any) {
+    // Per-tab routing: writes go to the attachment that fired the event, NOT
+    // the current attachment. A dialog on a backgrounded tab still consumes
+    // that tab's arming, not the active tab's. (This matters once `tab close`
+    // pops back to the origin — pending events from the closing tab still get
+    // delivered briefly before detach.)
+    const attachment = this.attachments.get(sourceTabId);
+    if (!attachment) return;
+
     if (method === 'Target.attachedToTarget') {
-      this.childSessions.set(params.sessionId, params.targetInfo);
+      attachment.childSessions.set(params.sessionId, params.targetInfo);
       this.log('info', `Auto-attached ${params.targetInfo.type}: ${params.targetInfo.url}`);
     } else if (method === 'Target.detachedFromTarget') {
-      this.childSessions.delete(params.sessionId);
-      this.cdpReadyChildren.delete(params.sessionId);
+      attachment.childSessions.delete(params.sessionId);
+      attachment.cdpReadyChildren.delete(params.sessionId);
     } else if (method === 'Page.javascriptDialogOpening') {
       // The JS thread is blocked until we respond. Resolve the one-shot
       // response if armed, else auto-accept so the script doesn't hang.
       // Fire-and-forget the dismissal — we can't await inside an event
       // listener, and any handleJavaScriptDialog failure is logged out-of-band.
-      const armed = this.nextDialogResponse;
-      this.nextDialogResponse = null;
+      const armed = attachment.nextDialogResponse;
+      attachment.nextDialogResponse = null;
       const response = armed ?? { accept: true, promptText: '' };
       const dialogType: string = params?.type ?? 'dialog';
       const messageQuoted = params?.message ? `"${String(params.message)}"` : '';
@@ -223,7 +344,7 @@ export class Page {
         'info',
         `Dialog ${dialogType}(${messageQuoted}) → ${choice}${armed ? '' : ' (default)'}`,
       );
-      this.sendCmd(this.tabTarget, 'Page.handleJavaScriptDialog', {
+      this.sendCmd(attachment.target, 'Page.handleJavaScriptDialog', {
         accept: response.accept,
         promptText: response.promptText,
       }).catch((err: any) =>
@@ -249,19 +370,27 @@ export class Page {
     if (this.detached) return;
     this.detached = true;
     if (this.listener) chrome.debugger.onEvent.removeListener(this.listener);
-    try {
-      await this.sendCmd(this.tabTarget, 'Target.setAutoAttach', {
-        autoAttach: false,
-        waitForDebuggerOnStart: false,
-        flatten: false,
-      });
-    } catch {}
-    await new Promise<void>((r) =>
-      chrome.debugger.detach(this.tabTarget, () => {
-        void chrome.runtime.lastError;
-        r();
-      }),
-    );
+
+    // Detach every tab we attached during this run. Order doesn't matter —
+    // each detach is independent. We catch & log per-tab so one bad tab
+    // (e.g., already closed) doesn't prevent the others from cleaning up.
+    const targets = [...this.attachments.values()].map((a) => a.target);
+    this.attachments.clear();
+    for (const target of targets) {
+      try {
+        await this.sendCmd(target, 'Target.setAutoAttach', {
+          autoAttach: false,
+          waitForDebuggerOnStart: false,
+          flatten: false,
+        });
+      } catch {}
+      await new Promise<void>((r) =>
+        chrome.debugger.detach(target, () => {
+          void chrome.runtime.lastError;
+          r();
+        }),
+      );
+    }
     this.log('info', 'Debugger detached.');
   }
 
@@ -323,6 +452,191 @@ export class Page {
         { timeoutMs: opts.waitForTimeoutMs },
       );
     }
+  }
+
+  // ---------- multi-tab orchestration ----------
+
+  /**
+   * Open a new tab at `url`, attach the debugger to it, and make it current.
+   * Pushes the previously-current tabId onto the origin stack so a subsequent
+   * `closeTab` returns focus to the right place.
+   *
+   * `waitForXPath` / `waitForTimeoutMs` mirror `goto`'s SPA-aware wait — the
+   * new tab's load completes when the HTML shell parses, which is too early
+   * for React/Vue/Angular. Pass an xpath that's guaranteed to render after
+   * mount to delay until the framework is up.
+   */
+  async openTab(
+    url: string,
+    opts: { waitForXPath?: string; waitForTimeoutMs?: number } = {},
+  ): Promise<number> {
+    const created = await chrome.tabs.create({
+      url,
+      active: true,
+      windowId: this.windowId,
+    });
+    if (created.id === undefined) {
+      throw new Error('tab open: chrome.tabs.create returned no tab id.');
+    }
+    // Push BEFORE switching so `closeTab` works even if attach fails mid-way.
+    this.originStack.push(this.currentTabId);
+    await waitForTabComplete(created.id, 30_000);
+    await this.attachTab(created.id);
+    this.log('info', `Opened new tab ${created.id} → ${url}`);
+    if (opts.waitForXPath) {
+      await this.waitFor(
+        { xpath: opts.waitForXPath },
+        { timeoutMs: opts.waitForTimeoutMs },
+      );
+    }
+    return created.id;
+  }
+
+  /**
+   * Switch the active tab to one matching either `urlMatches` or `index`
+   * within the window. Already-attached tabs cost only a pointer flip; new
+   * tabs pay the ~1s attach overhead the first time.
+   *
+   * Pushes onto the origin stack so the caller can `closeTab` back to where
+   * they came from. Pass `{noStack:true}` for direct switches that shouldn't
+   * be "undone" by a later close (currently unused — exposed for future
+   * ergonomics).
+   */
+  async switchToTab(
+    spec: { urlMatches?: string; index?: number },
+    opts: { noStack?: boolean } = {},
+  ): Promise<number> {
+    const tabs = await chrome.tabs.query(
+      this.windowId !== undefined ? { windowId: this.windowId } : {},
+    );
+    let target: chrome.tabs.Tab | undefined;
+    if (typeof spec.index === 'number') {
+      // tabs.query order matches the tab strip. `index` field on the Tab
+      // confirms the position so we don't get bitten by query order quirks.
+      target = tabs.find((t) => t.index === spec.index);
+    } else if (spec.urlMatches) {
+      const matcher = parseUrlMatcher(spec.urlMatches);
+      target = tabs.find((t) => matcher(t.url ?? t.pendingUrl ?? ''));
+    }
+    if (!target?.id) {
+      throw new Error(
+        `tab switchTo: no tab matched ${
+          spec.urlMatches ? `'${spec.urlMatches}'` : `index ${spec.index}`
+        }`,
+      );
+    }
+    if (target.id === this.currentTabId) {
+      this.log('info', `tab switchTo: already on tab ${target.id}.`);
+      return target.id;
+    }
+    if (!opts.noStack) this.originStack.push(this.currentTabId);
+    await chrome.tabs.update(target.id, { active: true });
+    await this.attachTab(target.id);
+    this.log('info', `Switched to tab ${target.id} (${target.url ?? ''}).`);
+    return target.id;
+  }
+
+  /**
+   * Wait for a new tab to open in this window (triggered by something the
+   * previous step did, e.g., clicking a `target="_blank"` link), then attach
+   * and activate it. The onCreated → onUpdated dance lives in
+   * `waitForNewTabMatching` over in tabAccess.ts.
+   */
+  async waitForNewTab(
+    opts: { urlMatches?: string; timeoutMs?: number } = {},
+  ): Promise<number> {
+    const timeoutMs = opts.timeoutMs ?? 10_000;
+    const id = await waitForNewTabMatching(this.windowId, opts.urlMatches, timeoutMs);
+    this.originStack.push(this.currentTabId);
+    await chrome.tabs.update(id, { active: true }).catch(() => {});
+    await waitForTabComplete(id, 30_000);
+    await this.attachTab(id);
+    this.log('info', `New tab ${id} ready; engine attached.`);
+    return id;
+  }
+
+  /**
+   * Close the current tab, detach its debugger session, and pop the origin
+   * stack to focus the previous tab. With an empty stack we just close and
+   * let Chrome decide focus.
+   */
+  async closeTab(): Promise<void> {
+    const closingId = this.currentTabId;
+    if (this.attachments.size === 1 && this.originStack.length === 0) {
+      throw new Error(
+        'tab close: refusing to close the only attached tab — that would orphan the run. Did you forget to open or switch first?',
+      );
+    }
+    const target = this.attachment.target;
+    // Detach BEFORE removing the tab. Otherwise Chrome closes the tab, fires
+    // the auto-detach event, and chrome.debugger.detach errors with "No tab
+    // with given id" — which we'd have to swallow.
+    try {
+      await this.sendCmd(target, 'Target.setAutoAttach', {
+        autoAttach: false,
+        waitForDebuggerOnStart: false,
+        flatten: false,
+      });
+    } catch {}
+    await new Promise<void>((r) =>
+      chrome.debugger.detach(target, () => {
+        void chrome.runtime.lastError;
+        r();
+      }),
+    );
+    this.attachments.delete(closingId);
+
+    try {
+      await chrome.tabs.remove(closingId);
+    } catch (err: any) {
+      // Tab might have already been closed by something else — that's fine.
+      this.log('info', `tab close: chrome.tabs.remove non-fatal: ${err?.message ?? err}`);
+    }
+
+    const previous = this.originStack.pop();
+    if (previous !== undefined && this.attachments.has(previous)) {
+      this.currentTabId = previous;
+      await chrome.tabs.update(previous, { active: true }).catch(() => {});
+      this.log('info', `Closed tab ${closingId}; back on tab ${previous}.`);
+    } else {
+      // Origin stack empty or the previous tab was closed by the page. Fall
+      // back to any remaining attached tab.
+      const fallback = this.attachments.keys().next().value;
+      if (fallback === undefined) {
+        throw new Error('tab close: no remaining attached tabs.');
+      }
+      this.currentTabId = fallback;
+      await chrome.tabs.update(fallback, { active: true }).catch(() => {});
+      this.log('info', `Closed tab ${closingId}; fell back to tab ${fallback}.`);
+    }
+  }
+
+  /**
+   * Cycle to the next/previous tab in the window's tab strip relative to the
+   * current one. Wraps at the ends. Pushes the origin so `close` can pop back.
+   */
+  async cycleTab(direction: 'next' | 'previous'): Promise<number> {
+    const tabs = await chrome.tabs.query(
+      this.windowId !== undefined ? { windowId: this.windowId } : {},
+    );
+    if (tabs.length === 0) {
+      throw new Error(`tab ${direction}: no tabs found in window.`);
+    }
+    tabs.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const i = tabs.findIndex((t) => t.id === this.currentTabId);
+    const step = direction === 'next' ? 1 : -1;
+    const target = tabs[(i + step + tabs.length) % tabs.length];
+    if (!target?.id || target.id === this.currentTabId) {
+      throw new Error(`tab ${direction}: nowhere to cycle to.`);
+    }
+    this.originStack.push(this.currentTabId);
+    await chrome.tabs.update(target.id, { active: true });
+    await this.attachTab(target.id);
+    this.log(
+      'info',
+      `Cycled ${direction} → tab ${target.id} (${target.url ?? ''}).`,
+    );
+    return target.id;
   }
 
   async fill(

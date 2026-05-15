@@ -70,7 +70,12 @@ export async function runJsonAutomation(
     log,
   };
 
-  const page = await Page.create(tab.id, log);
+  // Pass windowId through so multi-tab ops (tab switchTo / waitForNew / next /
+  // previous) scope queries to the user's window. Falls back to the tab's
+  // own windowId if the caller didn't supply one.
+  const scopedWindowId =
+    typeof windowId === 'number' ? windowId : tab.windowId ?? undefined;
+  const page = await Page.create(tab.id, scopedWindowId, log);
   try {
     await runScript(script, ctx, page);
     return ctx.outputs;

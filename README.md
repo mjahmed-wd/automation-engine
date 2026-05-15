@@ -23,12 +23,14 @@ Built on [WXT](https://wxt.dev/) + React 19 + TypeScript. XPath-only locators wi
 1. [Quick start](#quick-start)
 2. [Script structure](#script-structure)
 3. [Action reference](#action-reference)
-4. [Locator strategy](#locator-strategy)
-5. [Error handling](#error-handling)
-6. [Architecture (for contributors)](#architecture-for-contributors)
-7. [Testing](#testing)
-8. [Known limitations & non-goals](#known-limitations--non-goals)
-9. [Phases history](#phases-history)
+4. [Script injection via `evaluate`](#script-injection-via-evaluate)
+5. [Multi-tab orchestration](#multi-tab-orchestration)
+6. [Locator strategy](#locator-strategy)
+7. [Error handling](#error-handling)
+8. [Architecture (for contributors)](#architecture-for-contributors)
+9. [Testing](#testing)
+10. [Known limitations & non-goals](#known-limitations--non-goals)
+11. [Phases history](#phases-history)
 
 ---
 
@@ -63,7 +65,7 @@ Open any site (e.g., `example.com`), then paste this into the side panel:
 
 The log shows `Got "Example Domain" → title`, and the saved output renders below the editor.
 
-For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **27 scenarios** covering every action and every locator path.
+For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **22 fixture sections + 4 real-world examples** covering every action and every locator path.
 
 ---
 
@@ -113,7 +115,7 @@ Outputs from earlier `get` / `evaluate` / `describe` steps take precedence over 
 
 ## Action reference
 
-Fourteen actions, grouped by purpose. Each has a one-paragraph use case and a minimal example. For variants and edge cases, see the corresponding section in `test-fixtures/all-content.html`.
+Fourteen actions, grouped by purpose. Each has a one-paragraph use case and a minimal example. For variants and edge cases, see the corresponding section in `test-fixtures/all-content.html`. Multi-tab and script-injection capabilities get their own sections after the reference.
 
 ### Navigation
 
@@ -196,7 +198,7 @@ Default property: `value` for `<input>` / `<textarea>` / `<select>`, `innerText`
 
 #### `evaluate`
 
-Arbitrary JS escape hatch — runs in the main frame via `Runtime.evaluate` with `awaitPromise: true`. Use when no other action fits (read SPA state, compute derived values, trigger native browser actions).
+Arbitrary JS escape hatch — runs in the page's **main JS world** via `Runtime.evaluate` with `awaitPromise: true`. Same realm as the page's own inline `<script>` tags, NOT an isolated content-script world. The page can't tell whether a DOM mutation came from its own scripts or from outside. Use it to read SPA state, compute derived values, OR mutate the page (inject buttons, change CSS, delete elements) while the automation runs.
 
 ```jsonc
 { "action": "evaluate",
@@ -205,6 +207,8 @@ Arbitrary JS escape hatch — runs in the main frame via `Runtime.evaluate` with
 ```
 
 Multiple statements need an IIFE: `(() => { let n = 0; ... return n; })()`.
+
+See **[Script injection via `evaluate`](#script-injection-via-evaluate)** below for the full story — inject UI, change CSS, delete noisy elements, pull values out of `window.__REDUX_STORE__`, etc.
 
 #### `describe`
 
@@ -245,6 +249,146 @@ Pre-arm the response for the next native dialog (`alert` / `confirm` / `prompt` 
 ```
 
 The arming is one-shot — subsequent dialogs revert to auto-accept.
+
+#### `tab`
+
+Multi-tab orchestration. Six ops: `open` (engine-initiated new tab), `switchTo` (focus an existing tab by URL or index), `waitForNew` (wait for a tab opened by a page-side side effect like a `target="_blank"` link), `close` (close current and pop the origin stack), `next` / `previous` (cycle within the window).
+
+```jsonc
+{ "action": "tab", "op": "open", "url": "https://lookup.internal/sku/{{sku}}",
+  "waitForXPath": "//span[@id='price']" }
+{ "action": "tab", "op": "waitForNew", "urlMatches": "/customers/", "timeoutMs": 10000 }
+{ "action": "tab", "op": "switchTo", "urlMatches": "/\\/invoices\\/edit/" }
+{ "action": "tab", "op": "close" }
+```
+
+The engine keeps an internal origin stack: every op that changes the active tab pushes the previously-current tabId; `close` pops and reactivates whatever's on top. Nested side-tabs (open A → open B inside A → close B → still in A → close A → back to original) close in the right order. Already-attached tabs cost only a pointer flip on re-entry — no re-attach overhead for ping-pong patterns.
+
+See **[Multi-tab orchestration](#multi-tab-orchestration)** below for the full flow including page-triggered vs script-triggered patterns and the `urlMatches` syntax.
+
+---
+
+## Script injection via `evaluate`
+
+`evaluate` runs your expression in the page's **main JS world** via CDP `Runtime.evaluate`. Same realm as the page's own inline `<script>` tags, **not** an isolated content-script world. Anything you can do in DevTools Console, you can do here.
+
+This is the escape hatch for "modify the page while the automation runs" — patterns that pay off in CRM workflows:
+
+- Dim rows you've already processed
+- Hide noisy UI (chat widgets, toast banners, feedback prompts) before screenshots
+- Inject a custom progress badge or "Mark as reviewed" button
+- Pull values out of `window.__REDUX_STORE__` or other framework internals
+- Override a stylesheet to make text legible against the screenshot background
+- Delete sections of the DOM that confuse downstream `describe` queries
+
+### Practical examples
+
+Inject a floating button with a click handler:
+
+```jsonc
+{ "action": "evaluate",
+  "expression": "(() => { const b = document.createElement('button'); b.textContent='Mark reviewed'; b.style.cssText='position:fixed;top:10px;right:10px;z-index:9999;padding:8px 12px'; b.onclick=() => fetch('/api/mark', {method:'POST'}); document.body.appendChild(b); return 'added'; })()" }
+```
+
+Inject a stylesheet (then reverse it by id):
+
+```jsonc
+{ "action": "evaluate",
+  "expression": "(() => { const s = document.createElement('style'); s.id='dim-rows'; s.textContent='tr.completed { opacity: 0.3 !important; }'; document.head.appendChild(s); return 'dimmed'; })()" }
+```
+
+Reverse:
+
+```jsonc
+{ "action": "evaluate",
+  "expression": "document.getElementById('dim-rows')?.remove()" }
+```
+
+Pull values out of the page's globals:
+
+```jsonc
+{ "action": "evaluate",
+  "expression": "JSON.stringify({ store: window.__REDUX_STORE__?.getState()?.user?.id, url: location.href, title: document.title })",
+  "saveAs": "snapshot" }
+```
+
+Delete noisy UI before grabbing state:
+
+```jsonc
+{ "action": "evaluate",
+  "expression": "document.querySelectorAll('.toast, .feedback-banner, .chat-widget').forEach(n => n.remove())" }
+```
+
+Section 22 of `test-fixtures/all-content.html` is the live cookbook — four pasteable scripts that inject a button, dark-mode the page, delete sections, and rewrite text.
+
+### Mechanics
+
+- **Main JS world.** The expression sees `window`, `document`, every global the page has set up (Redux store, jQuery, framework internals — whatever the page exposes). It does **not** see anything from the extension's side — no `chrome.*` APIs, no side-panel state, no React state.
+- **Script mode, not module mode.** A bare `var x = 5; x` returns `undefined`. Wrap multi-statement code in an IIFE — `(() => { var x = 5; return x; })()` — and the return value comes back.
+- **Async works.** `awaitPromise: true` is set internally, so `(async () => await fetch('/x').then(r => r.json()))()` just works.
+- **Return values serialize.** Primitives come through as themselves; plain objects/arrays get `JSON.stringify`-ed into `ctx.outputs[saveAs]`; DOM nodes return as `{}` (V8 can't serialize an `HTMLElement`).
+- **Errors surface cleanly.** Exceptions propagate with V8's description — `Failed: evaluate: ReferenceError: foo is not defined`.
+- **Same-origin only.** Can't reach into cross-origin iframes via `iframe.contentWindow.document`. Same-origin iframes work via `document.querySelector('iframe').contentWindow.…` inside the expression.
+- **Main frame only.** This iteration of `evaluate` runs in the top frame. Other actions (click, fill, get) automatically walk into same-origin iframes.
+- **Persistence is page-lifetime.** Mutations live until navigation/reload. The next `goto` wipes the slate. For permanent modifications, write a real content script in the manifest — but for "modify the page while the automation runs," `evaluate` is the right tool.
+- **Same security as the page.** The expression runs with the page's origin and privileges. Can't escalate beyond what the page itself could do — but also can't be sandboxed *more* than the page is.
+
+### When to reach for it vs. dedicated actions
+
+Use the dedicated action (`click`, `fill`, `get`, etc.) when it fits — those go through `withLocatorContext` for structured "Failed to ..." errors, share the `timeoutMs` deadline, and integrate with closed-shadow auto-detect. `evaluate` is for things no dedicated action covers: page mutation, reading non-DOM globals, conditional logic, asynchronous workflows in a single step.
+
+---
+
+## Multi-tab orchestration
+
+The `tab` action lets a script open, switch between, and close tabs. The engine keeps every visited tab's debugger session live for the duration of the run; switching back is a pointer flip, not a re-attach. ~1s of attach overhead is paid only on first visit.
+
+### Page-triggered: drive a tab opened by a page click
+
+A row in a list view has a "View customer" button that opens detail in a new tab:
+
+```jsonc
+[
+  { "action": "click", "xpath": "//a[contains(., 'View customer')]" },
+  { "action": "tab",   "op": "waitForNew", "urlMatches": "/customers/", "timeoutMs": 10000 },
+  { "action": "get",   "xpath": "//span[@id='loyalty-tier']", "saveAs": "tier" },
+  { "action": "tab",   "op": "close" },
+  { "action": "fill",  "xpath": "//textarea[@name='notes']", "value": "Tier: {{tier}}" }
+]
+```
+
+After `tab close`, the engine reactivates the tab it switched from. No explicit "switchTo original" step needed.
+
+### Script-triggered: open a side tab for a lookup
+
+The script proactively opens a side tab to a reference page, reads a value, closes, returns:
+
+```jsonc
+[
+  { "action": "tab",  "op": "open", "url": "https://lookup.internal/sku/{{sku}}",
+    "waitForXPath": "//span[@id='price']" },
+  { "action": "get",  "xpath": "//span[@id='price']", "saveAs": "price" },
+  { "action": "tab",  "op": "close" },
+  { "action": "fill", "xpath": "//input[@name='quoted_price']", "value": "{{price}}" }
+]
+```
+
+`tab open` goes through `chrome.tabs.create` via the extension's `tabs` permission, so it's not subject to the page's popup blocker — works on `file://` origins too. Prefer this over page-triggered when the script knows the URL it wants.
+
+### `urlMatches` patterns
+
+Plain string is a **substring** match. `/regex/flags` is a **RegExp**. Both support `{{var}}` substitution.
+
+```jsonc
+{ "action": "tab", "op": "switchTo", "urlMatches": "/invoices/edit/" }
+{ "action": "tab", "op": "switchTo", "urlMatches": "/\\/customers\\/(\\d+)/" }
+```
+
+### Notes
+
+- `tab close` refuses to close the only attached tab when the origin stack is empty — would orphan the run.
+- `tab next` / `tab previous` cycle within the window. They push the origin stack so a subsequent `close` brings focus back, but they're typically used for moving forward, not for round-trips.
+- `windowId` is a soft filter for `waitForNew`: tabs from other windows are still candidates because `window.open(_, '_blank')` on `file://` commonly lands the popup in a fresh Chrome window.
 
 ---
 
@@ -350,16 +494,17 @@ The log auto-scrolls. Click **Clear** to reset.
 
 ```
 src/automation/
-├── schema.ts              Step types + AutomationStep union, substituteRaw / substituteXPath / xpathStringLiteral
+├── schema.ts              Step types + AutomationStep union (includes TabStep), substituteRaw / substituteXPath / xpathStringLiteral
 ├── parse.ts               JSON5 parse + validateScript (the per-action validator map)
 ├── interpreter.ts         runScript — walks AutomationStep[] and dispatches via the action registry
 ├── locator.ts             buildActionExpression / buildResolveExpression / buildDescribeExpression / buildCallFunctionExpression
-├── page.ts                Page class — chrome.debugger client, runUntilFound, cdpFindAndAct, cdpResolveXPath, dialog handling
+├── page.ts                Page class — chrome.debugger client, multi-tab attachment map, fast-path + CDP, dialog handling
 ├── errors.ts              withLocatorContext wrapper for structured action-handler errors
 ├── loader.ts              import.meta.glob loader for automations/*.json
+├── tabs.ts                parseUrlMatcher + waitForNewTabMatching + waitForTabComplete + isAttachable
 ├── index.ts               barrel export
 └── actions/
-    ├── index.ts           Registry: { goto: gotoAction, fill: fillAction, ... }
+    ├── index.ts           Registry: { goto: gotoAction, fill: fillAction, ..., tab: tabAction }
     ├── goto.ts
     ├── fill.ts
     ├── get.ts
@@ -372,16 +517,18 @@ src/automation/
     ├── selectOption.ts
     ├── hover.ts
     ├── dialog.ts
-    └── describe.ts
+    ├── describe.ts
+    └── tab.ts             Multi-tab orchestration (open / switchTo / waitForNew / close / next / previous)
 
 entrypoints/
 ├── background/            Service worker — message dispatcher + automation runner
 │   ├── index.ts           defineBackground + sidePanel setup + onMessage dispatcher + broadcastLog
-│   ├── runJsonAutomation.ts   The script-running function; takes LogFn as a parameter
-│   └── tabAccess.ts       isAttachable + waitForTabComplete helpers
+│   ├── runJsonAutomation.ts   The script-running function; takes LogFn + windowId
+│   └── tabAccess.ts       Re-export shim of src/automation/tabs.ts (back-compat)
 └── sidepanel/             React UI
     ├── App.tsx
-    ├── main.tsx
+    ├── main.tsx           React entry
+    ├── main.ts            vestigial migration stub (env couldn't delete it)
     ├── style.css
     └── index.html
 
@@ -389,8 +536,8 @@ automations/               Local script library — gitignored except .gitkeep
                            import.meta.glob picks up every *.json at build time
 
 test-fixtures/
-└── all-content.html       Self-documenting fixture: 27 scenarios with copy-paste JSON,
-                           expected outcomes, and a Try-it block per case. Doubles as
+└── all-content.html       Self-documenting fixture: 22 sections (21 happy-path + 1 closed-shadow + script-injection cookbook)
+                           + 4 real-world examples (MUI, react-select, W3Schools, Shepherd). Doubles as
                            the smoke-automation target.
 
 e2e/                       Playwright suite
@@ -398,7 +545,8 @@ e2e/                       Playwright suite
 ├── helpers/sidepanel.ts   pasteAndRun, waitForLog, forceFocus
 └── specs/
     ├── smoke.spec.ts
-    └── fatal-paths.spec.ts
+    ├── fatal-paths.spec.ts
+    └── multi-tab.spec.ts  Page-triggered + script-triggered + negative-timeout
 
 src/automation/*.test.ts   Vitest unit tests (schema, parse, locator)
 ```
@@ -434,7 +582,7 @@ npm test           # one-shot
 npm run test:watch # watch mode
 ```
 
-54 tests, runs in under 2 seconds. No browser, no extension load.
+65 tests, runs in under 2 seconds. No browser, no extension load.
 
 ### E2E tests (Playwright)
 
@@ -446,7 +594,7 @@ npm run test:e2e                  # builds extension first, then runs suite
 npm run test:e2e:ui               # interactive UI
 ```
 
-4 tests — one full mega-fixture smoke + 3 fatal-path scenarios. Runs in ~2-3 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
+7 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 3 multi-tab cases (page-triggered, script-triggered, negative timeout). Runs in ~3-4 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
 
 Three E2E-specific shims live in the test setup; touch them only if you understand the comments first:
 
@@ -462,7 +610,7 @@ Three E2E-specific shims live in the test setup; touch them only if you understa
 2. Run `phase4-fixture-smoke.json` from the dropdown (lives in your `automations/` folder).
 3. Watch the panel log: every action should report green, every result paragraph in the fixture should reflect the expected outcome.
 
-The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 27 scenarios across 14 actions plus 4 real-world examples (MUI, react-select, W3Schools, Shepherd).
+The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 22 sections (every action plus the multi-tab and script-injection cookbooks) plus 4 real-world examples (MUI, react-select, W3Schools, Shepherd).
 
 ---
 
@@ -474,10 +622,12 @@ These are *not* bugs — they're explicit scope choices.
 - **`evaluate` runs in the main frame only.** Reach into same-origin iframes from inside your expression (`document.querySelector('iframe').contentWindow.…`); cross-origin iframe evaluation isn't supported.
 - **`upload` requires absolute file paths.** Relative paths get rejected at action-handler time. Chrome resolves relative paths against an unpredictable cwd.
 - **No built-in credentials handling.** Secrets currently live in script `variables`, which means they're in the JSON. A `chrome.storage.local`-backed `{{secrets.password}}` mechanism is a future-phase candidate.
-- **No multi-tab orchestration.** The engine drives one active tab per script run. Switching tabs mid-script isn't supported. Future-phase candidate.
-- **No screenshots-on-failure.** `Page.captureScreenshot` is a one-call wrapper away — included on the future-phase shortlist.
+- **No retry policy.** A flaky step fails the whole run. Phase 5 Batch 2 adds `retries?` + `retryDelay?` to every locator-using step.
+- **No screenshots-on-failure.** `Page.captureScreenshot` is a one-call wrapper away — declined for now (engine errors are detailed enough). Easy to add later if real demand surfaces.
 - **No recorder.** Scripts are written by hand. A click-recorder UI would be a major UX leap and a major implementation investment.
 - **One `<select>`-per-action.** `selectOption` works on one select at a time. Bulk operations require multiple steps.
+- **`goto` short-circuits when already at the target URL.** Optimization for fast re-runs, but bites if you edit the page on disk and need a fresh render — manually reload the tab in Chrome (⌘R) between runs.
+- **`file://` popup blocker on `window.open`.** `<a target="_blank">` clicks from inside a click handler on `file://` pages sometimes get swallowed. Workarounds: allow popups for `file:///` in `chrome://settings/content/popups`, OR use `tab open` (extension-side) instead of relying on the page-side `window.open`.
 
 ---
 
@@ -490,5 +640,13 @@ Mapping commit history to milestones:
 - **Phase 2** — New actions: `evaluate`, `upload`, `selectOption`, `hover`. (`press` predates this phase.)
 - **Phase 3** — Frame & navigation hardening: `goto.waitForXPath` for SPA-aware navigation, native dialog handling (`Page.enable` + `Page.handleJavaScriptDialog`).
 - **Phase 4** — DX & error reporting: structured error messages, `describe` action, parse-time JSON validation, Vitest unit suite, Playwright E2E suite, mega-fixture cookbook (`all-content.html`), background folder refactor, this README.
+- **Phase 5 Batch 1** — Multi-tab orchestration: `tab` action (open / switchTo / waitForNew / close / next / previous), `Page` class restructured around a per-tab `TabAttachment` map so revisiting a tab is a pointer flip not a re-attach, origin stack for `close` to pop back, `windowId` threading, fixture section 21 + 22 (multi-tab + script injection), three new E2E specs.
+
+Pending Phase 5 batches:
+
+- **Batch 1.5 — Multi-window extension.** Engine-initiated new browser window via `chrome.windows.create`. Adds `op: 'openWindow'` to the `tab` step (or extends `op: 'open'` with a `newWindow: true` flag — TBD) with optional `windowType: 'normal' | 'popup'`, `width`, `height`, `left`, `top`. Origin stack + close-pops-back behavior reuses Batch 1's tab plumbing. ~1-2 hours.
+- **Batch 2 — Step retry policy.** `retries?: number` (default 0) and `retryDelay?: number` (default 500ms) on every locator-using step. Non-fatal errors retry; `FatalActionError` (disabled / readonly) doesn't. Open question: whether `covered` retries by default. Validator update + interpreter wrap-step helper. ~3 hours.
+- **Batch 3 — Network waits.** New `waitForResponse` step backed by `Network.responseReceived` events. URL pattern auto-detects substring vs `/regex/flags`. Predicate-keyed waiter-set abstraction (reusable for Batch 1's `waitForNew`). `Network.enable` disables disk cache for the session — worth documenting. ~half day.
+- **Batch 4 — Conditional / branching.** `if` step with `xpathExists` + `then` + `else` + `timeoutMs`. `forEach` step with `items` + `as` + `do`. `runScript` becomes recursive; validator gets a depth cap (~20) to catch infinite nesting. Variable scoping: `forEach` writes the current item to `ctx.variables[step.as]`; saved outputs collide across iterations (last-wins) — namespace later if it bites. ~1 day.
 
 Skipped scope (explicitly): nested-iframe forwarding (low real-world need for CRM workflows; revisit if a concrete use case surfaces).
