@@ -42,6 +42,13 @@ export const test = base.extend<ExtensionFixtures>({
         '--allow-file-access-from-files',
         '--no-first-run',
         '--no-default-browser-check',
+        // file:// pages can't open popups by default even from a trusted
+        // click handler — Chrome's popup blocker has additional restrictions
+        // on local-file origins. Real users grant this via
+        // chrome://settings/content/popups; Playwright's chromium doesn't
+        // inherit that setting, so we pass the flag explicitly. Scopes only
+        // to this test process.
+        '--disable-popup-blocking',
       ],
     });
 

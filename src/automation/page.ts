@@ -101,15 +101,52 @@ export interface DescribeResult {
 }
 
 /**
+ * Reason codes for `FatalActionError`. Used by the Batch 2 retry policy to
+ * decide whether retrying makes sense. Stable states (disabled / read-only /
+ * no-match / not-a-select / unknown) won't fix themselves and don't retry;
+ * `covered` is transient (toast banners, loading scrims) and retries by
+ * default. Add new reasons here when the engine grows new fatal categories.
+ */
+export type FatalReason =
+  | 'disabled'
+  | 'read-only'
+  | 'covered'
+  | 'no-match'
+  | 'not-a-select'
+  | 'unknown';
+
+/**
  * Thrown when the in-page function signals `fatal:true`. We use a typed error
  * so `runAction` can distinguish "didn't find it, try CDP" from "found it but
- * the page state forbids the action — stop searching."
+ * the page state forbids the action — stop searching." Carries a `reason`
+ * field so `runStepWithRetry` (in interpreter.ts) can decide whether to
+ * retry without parsing the message.
  */
 export class FatalActionError extends Error {
   readonly fatal = true as const;
-  constructor(message: string) {
+  readonly reason: FatalReason;
+  constructor(message: string, reason: FatalReason = 'unknown') {
     super(message);
     this.name = 'FatalActionError';
+    this.reason = reason;
+  }
+}
+
+/**
+ * Map the in-page IIFE's `reason` string (untyped) onto our typed
+ * `FatalReason` enum. Anything not on the list collapses to `'unknown'` so
+ * the retry policy in interpreter.ts can still decide deterministically.
+ */
+function coerceFatalReason(s: string | undefined): FatalReason {
+  switch (s) {
+    case 'disabled':
+    case 'read-only':
+    case 'covered':
+    case 'no-match':
+    case 'not-a-select':
+      return s;
+    default:
+      return 'unknown';
   }
 }
 
@@ -615,6 +652,41 @@ export class Page {
     opts: { urlMatches?: string; timeoutMs?: number } = {},
   ): Promise<number> {
     const timeoutMs = opts.timeoutMs ?? 10_000;
+
+    // Race-tolerant pre-check. The page's onclick handler may have called
+    // window.open SYNCHRONOUSLY inside the prior `click` step, which means
+    // chrome.tabs.onCreated has already fired by the time we get here. The
+    // listener-based wait would then sit idle forever — there's no future
+    // onCreated to receive. Query for any matching tab that isn't already
+    // attached, treat that as the new tab if found.
+    //
+    // Safety: we exclude `this.currentTabId` and anything in
+    // `this.attachments` (tabs the engine itself opened or is driving). A
+    // pre-existing unrelated tab whose URL coincidentally matches the
+    // pattern would still be caught — keep urlMatches specific in scripts.
+    if (opts.urlMatches) {
+      const matcher = parseUrlMatcher(opts.urlMatches);
+      const existing = await chrome.tabs.query({});
+      for (const t of existing) {
+        if (t.id === undefined) continue;
+        if (t.id === this.currentTabId) continue;
+        if (this.attachments.has(t.id)) continue;
+        const url = t.url ?? t.pendingUrl ?? '';
+        if (url && matcher(url)) {
+          this.log(
+            'info',
+            `Found matching tab ${t.id} already open (race with prior step); attaching.`,
+          );
+          this.originStack.push(this.currentTabId);
+          await chrome.tabs.update(t.id, { active: true }).catch(() => {});
+          await waitForTabComplete(t.id, 30_000);
+          await this.attachTab(t.id);
+          return t.id;
+        }
+      }
+    }
+
+    // No pre-existing match — set up the listener-based wait.
     const id = await waitForNewTabMatching(this.windowId, opts.urlMatches, timeoutMs);
     this.originStack.push(this.currentTabId);
     await chrome.tabs.update(id, { active: true }).catch(() => {});
@@ -864,6 +936,7 @@ export class Page {
         if (out?.fatal) {
           throw new FatalActionError(
             out.message ?? `Click target is ${out.reason ?? 'rejected'}`,
+            coerceFatalReason(out.reason),
           );
         }
       } finally {
@@ -1047,6 +1120,7 @@ export class Page {
         if (out?.fatal) {
           throw new FatalActionError(
             out.message ?? `Hover target is ${out.reason ?? 'rejected'}`,
+            coerceFatalReason(out.reason),
           );
         }
       } finally {
@@ -1482,7 +1556,10 @@ export class Page {
         | { ok: boolean; fatal?: boolean; reason?: string; message?: string; selected?: number }
         | undefined;
       if (result?.fatal) {
-        throw new FatalActionError(result.message ?? 'selectOption rejected');
+        throw new FatalActionError(
+          result.message ?? 'selectOption rejected',
+          coerceFatalReason(result.reason),
+        );
       }
       count = result?.selected ?? 0;
     } finally {
@@ -1615,6 +1692,7 @@ export class Page {
       if (main?.fatal) {
         throw new FatalActionError(
           main.message ?? `Action rejected: ${main.reason ?? 'unknown'}`,
+          coerceFatalReason(main.reason),
         );
       }
       if (typeof main?.inputs === 'number') maxInputs = Math.max(maxInputs, main.inputs);
@@ -1638,6 +1716,7 @@ export class Page {
           if (value?.fatal) {
             throw new FatalActionError(
               value.message ?? `Action rejected: ${value.reason ?? 'unknown'}`,
+              coerceFatalReason(value.reason),
             );
           }
           if (typeof value?.inputs === 'number') maxInputs = Math.max(maxInputs, value.inputs);
@@ -1745,6 +1824,7 @@ export class Page {
       if (out?.fatal) {
         throw new FatalActionError(
           out.message ?? `Action rejected: ${out.reason ?? 'unknown'}`,
+          coerceFatalReason(out.reason),
         );
       }
       return out;

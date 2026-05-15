@@ -41,28 +41,61 @@ export function parseUrlMatcher(pattern: string | undefined): (url: string) => b
   return (url) => url.includes(pattern);
 }
 
-/** Wait until `tab.status === 'complete'` for the given tab, up to `timeoutMs`. */
+/**
+ * Wait until `tab.status === 'complete'` for the given tab, up to `timeoutMs`.
+ *
+ * Race-tolerant: in addition to listening for `onUpdated`, also polls
+ * `chrome.tabs.get` every 250ms. This catches the case where the
+ * `'complete'` event fires before the listener attaches (common in
+ * Playwright's persistent context, where event timing differs from a normal
+ * user-driven Chrome). Polling overhead is negligible — at most a handful of
+ * chrome.tabs.get calls before resolve.
+ */
 export function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(poller);
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error('Timed out waiting for tab to load'));
-    }, timeoutMs);
+      err ? reject(err) : resolve();
+    };
+
+    const timer = setTimeout(
+      () => finish(new Error('Timed out waiting for tab to load')),
+      timeoutMs,
+    );
+
     const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
-      if (id === tabId && info.status === 'complete') {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
+      if (id === tabId && info.status === 'complete') finish();
     };
     chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.get(tabId).then((t) => {
-      if (t.status === 'complete') {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    });
+
+    // Race fallback: poll the tab status. If the 'complete' event fired
+    // before the listener attached (Playwright is fast enough that this
+    // happens consistently for file:// loads), the poller catches it
+    // within 250ms instead of waiting forever for an event that won't
+    // come.
+    const poller = setInterval(() => {
+      chrome.tabs
+        .get(tabId)
+        .then((t) => {
+          if (t.status === 'complete') finish();
+        })
+        .catch(() => {
+          /* tab may have been closed mid-wait; let timeout handle it */
+        });
+    }, 250);
+
+    // Immediate check, same as before — fast path for already-complete tabs.
+    chrome.tabs
+      .get(tabId)
+      .then((t) => {
+        if (t.status === 'complete') finish();
+      })
+      .catch(() => {});
   });
 }
 

@@ -79,6 +79,28 @@ const isString = (v: unknown): v is string => typeof v === 'string';
 const isNumber = (v: unknown): v is number => typeof v === 'number' && !Number.isNaN(v);
 const isBoolean = (v: unknown): v is boolean => typeof v === 'boolean';
 
+/**
+ * Shared validator for the `retries` / `retryDelay` mixin fields. Called from
+ * every locator-using step's validator. Caps retries at 5 because worst-case
+ * time per step is (retries+1) × timeoutMs + retries × retryDelay — at 5
+ * retries with a default 20s timeout that's already ~2 minutes per step,
+ * usually a sign the script should be restructured instead.
+ */
+const MAX_RETRIES = 5;
+function validateRetryFields(s: any, n: number): string | null {
+  if (s.retries !== undefined) {
+    if (!isNumber(s.retries) || !Number.isInteger(s.retries) || s.retries < 0)
+      return `Step ${n}: retries must be a non-negative integer.`;
+    if (s.retries > MAX_RETRIES)
+      return `Step ${n}: retries capped at ${MAX_RETRIES} (got ${s.retries}). At default 20s timeoutMs, that's already ~2 minutes per step — restructure the script if you need more.`;
+  }
+  if (s.retryDelay !== undefined) {
+    if (!isNumber(s.retryDelay) || s.retryDelay < 0)
+      return `Step ${n}: retryDelay must be a non-negative number (milliseconds).`;
+  }
+  return null;
+}
+
 /** Exported so unit tests can pin the keyset against actions/index.ts. */
 export const stepValidators: Record<string, StepValidator> = {
   goto: (s, n) => {
@@ -96,7 +118,7 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: fill.timeoutMs must be a number.`;
     if (s.pierceClosed !== undefined && !isBoolean(s.pierceClosed))
       return `Step ${n}: fill.pierceClosed must be a boolean.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   get: (s, n) => {
     if (!isString(s.xpath)) return `Step ${n}: get requires "xpath" (string).`;
@@ -110,7 +132,7 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: get.regex must be a string.`;
     if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
       return `Step ${n}: get.timeoutMs must be a number.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   click: (s, n) => {
     if (!isString(s.xpath)) return `Step ${n}: click requires "xpath" (string).`;
@@ -118,7 +140,7 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: click.timeoutMs must be a number.`;
     if (s.pierceClosed !== undefined && !isBoolean(s.pierceClosed))
       return `Step ${n}: click.pierceClosed must be a boolean.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   wait: (s, n) => {
     if (!isNumber(s.ms)) return `Step ${n}: wait requires "ms" (number).`;
@@ -128,13 +150,13 @@ export const stepValidators: Record<string, StepValidator> = {
     if (!isString(s.xpath)) return `Step ${n}: waitFor requires "xpath" (string).`;
     if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
       return `Step ${n}: waitFor.timeoutMs must be a number.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   press: (s, n) => {
     if (!isString(s.key)) return `Step ${n}: press requires "key" (string, e.g. "Enter").`;
     if (s.xpath !== undefined && !isString(s.xpath))
       return `Step ${n}: press.xpath must be a string when provided.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   evaluate: (s, n) => {
     if (!isString(s.expression))
@@ -143,7 +165,7 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: evaluate.saveAs must be a string.`;
     if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
       return `Step ${n}: evaluate.timeoutMs must be a number.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   upload: (s, n) => {
     if (!isString(s.xpath)) return `Step ${n}: upload requires "xpath" (string).`;
@@ -159,7 +181,7 @@ export const stepValidators: Record<string, StepValidator> = {
           return `Step ${n}: upload.files[${i}] must be a string.`;
       }
     }
-    return null;
+    return validateRetryFields(s, n);
   },
   selectOption: (s, n) => {
     if (!isString(s.xpath))
@@ -170,13 +192,13 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: selectOption requires "value" or "label".`;
     if (hasValue && hasLabel)
       return `Step ${n}: selectOption: provide exactly one of "value" or "label", not both.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   hover: (s, n) => {
     if (!isString(s.xpath)) return `Step ${n}: hover requires "xpath" (string).`;
     if (s.timeoutMs !== undefined && !isNumber(s.timeoutMs))
       return `Step ${n}: hover.timeoutMs must be a number.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   dialog: (s, n) => {
     if (s.accept !== undefined && !isBoolean(s.accept))
@@ -190,7 +212,7 @@ export const stepValidators: Record<string, StepValidator> = {
       return `Step ${n}: describe requires "xpath" (string).`;
     if (s.saveAs !== undefined && !isString(s.saveAs))
       return `Step ${n}: describe.saveAs must be a string.`;
-    return null;
+    return validateRetryFields(s, n);
   },
   tab: (s, n) => {
     const KNOWN_OPS = [
@@ -261,7 +283,7 @@ export const stepValidators: Record<string, StepValidator> = {
         return `Step ${n}: tab.waitForNew.timeoutMs must be a number.`;
     }
 
-    return null;
+    return validateRetryFields(s, n);
   },
 };
 

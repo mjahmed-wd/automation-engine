@@ -23,14 +23,15 @@ Built on [WXT](https://wxt.dev/) + React 19 + TypeScript. XPath-only locators wi
 1. [Quick start](#quick-start)
 2. [Script structure](#script-structure)
 3. [Action reference](#action-reference)
-4. [Script injection via `evaluate`](#script-injection-via-evaluate)
-5. [Multi-tab orchestration](#multi-tab-orchestration)
-6. [Locator strategy](#locator-strategy)
-7. [Error handling](#error-handling)
-8. [Architecture (for contributors)](#architecture-for-contributors)
-9. [Testing](#testing)
-10. [Known limitations & non-goals](#known-limitations--non-goals)
-11. [Phases history](#phases-history)
+4. [Retry policy](#retry-policy)
+5. [Script injection via `evaluate`](#script-injection-via-evaluate)
+6. [Multi-tab orchestration](#multi-tab-orchestration)
+7. [Locator strategy](#locator-strategy)
+8. [Error handling](#error-handling)
+9. [Architecture (for contributors)](#architecture-for-contributors)
+10. [Testing](#testing)
+11. [Known limitations & non-goals](#known-limitations--non-goals)
+12. [Phases history](#phases-history)
 
 ---
 
@@ -65,7 +66,7 @@ Open any site (e.g., `example.com`), then paste this into the side panel:
 
 The log shows `Got "Example Domain" → title`, and the saved output renders below the editor.
 
-For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **22 fixture sections + 6 real-world examples** covering every action and every locator path.
+For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **23 fixture sections + 6 real-world examples** covering every action, every locator path, the multi-tab/window flow, script injection, and the retry policy.
 
 ---
 
@@ -268,6 +269,59 @@ Multi-tab + multi-window orchestration. Seven ops: `open` (engine-initiated new 
 The engine keeps an internal origin stack: every op that changes the active tab pushes the previously-current tabId; `close` pops and reactivates whatever's on top. Nested side-tabs (open A → open B inside A → close B → still in A → close A → back to original) close in the right order. Already-attached tabs cost only a pointer flip on re-entry — no re-attach overhead for ping-pong patterns.
 
 See **[Multi-tab orchestration](#multi-tab-orchestration)** below for the full flow including page-triggered vs script-triggered patterns and the `urlMatches` syntax.
+
+---
+
+## Retry policy
+
+Every locator-using step accepts two optional fields that let the engine handle transient flake transparently:
+
+```jsonc
+{ "action": "click", "xpath": "//button[@id='save']",
+  "retries": 3,           // optional, default 0 — number of ADDITIONAL attempts
+  "retryDelay": 500 }     // optional, default 500ms — wait between attempts
+```
+
+Total attempts is `retries + 1`. Worst-case wall-clock time per step is `(retries + 1) × timeoutMs + retries × retryDelay`. The validator caps `retries` at 5 — at the default 20s `timeoutMs` that's already ~2 minutes per step; anything more usually means the script needs restructuring.
+
+### Retry decision tree
+
+| Failure | Retries? | Why |
+|---|---|---|
+| Generic error (`Locator not found within Ns`) | Yes | Flake — could be a widget race, slow CDN, or animation. Retry is exactly what the user wants. |
+| `FatalActionError` reason `disabled` | No | Stable state. A disabled `<input>` won't fix itself; retrying wastes the script's budget. |
+| `FatalActionError` reason `read-only` | No | Same as `disabled`. |
+| `FatalActionError` reason `no-match` (selectOption) | No | The option you asked for doesn't exist; retry won't make it exist. |
+| `FatalActionError` reason `not-a-select` | No | You pointed at a `<div>`, not a `<select>`. Schema problem, not a flake. |
+| `FatalActionError` reason `covered` | **Yes** | Overlays are transient: toast banners, loading scrims, and modal backdrops routinely self-dismiss. Retry by default. |
+
+The reason field on `FatalActionError` is exposed by the engine, but you don't need to think about it — the interpreter's `runStepWithRetry` wraps every step and applies the decision tree automatically.
+
+### When to use retries
+
+Good fits:
+
+- A widget that needs framework hydration before its handlers fire (`click` lands but no-ops the first time).
+- A submit button that briefly disables during client-side validation, then re-enables.
+- A modal that takes a moment to mount; without a fixed `wait`, you don't know exactly how long.
+- A toast banner that briefly covers your target.
+
+Less helpful:
+
+- "I want the script to keep trying for 10 minutes" — use a bigger `timeoutMs`, not a higher `retries`. Retries are bounded at 5.
+- Hiding a real schema or selector bug. If a step fails consistently, retries just make the failure slower.
+
+### Log output
+
+Side panel shows each attempt explicitly so the engine doesn't look stuck:
+
+```
+→ Step 2/5: click
+Attempt 1/4 failed: Locator not found within 0.5s. Retrying in 500ms…
+Attempt 2/4 failed: Locator not found within 0.5s. Retrying in 500ms…
+Clicked button#save (trusted) at (412, 188) in https://example.com/
+Step click succeeded on retry 2/3.
+```
 
 ---
 
@@ -602,7 +656,7 @@ automations/               Local script library — gitignored except .gitkeep
                            import.meta.glob picks up every *.json at build time
 
 test-fixtures/
-└── all-content.html       Self-documenting fixture: 22 sections (every action + multi-tab + script-injection)
+└── all-content.html       Self-documenting fixture: 23 sections (every action + multi-tab + script-injection + retry)
                            + 6 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo
                            new-tab, Wikipedia/DuckDuckGo popup-window). Doubles as the smoke-automation target.
 
@@ -612,9 +666,10 @@ e2e/                       Playwright suite
 └── specs/
     ├── smoke.spec.ts
     ├── fatal-paths.spec.ts
-    └── multi-tab.spec.ts  Page-triggered + script-triggered + negative-timeout
+    ├── multi-tab.spec.ts  Page-triggered + script-triggered + openWindow + negative-timeout
+    └── retry.spec.ts      Baseline fail-fast + retry-succeeds + covered-overlay
 
-src/automation/*.test.ts   Vitest unit tests (schema, parse, locator)
+src/automation/*.test.ts   Vitest unit tests (schema, parse, locator, interpreter)
 ```
 
 ### How to add a new action
@@ -648,7 +703,7 @@ npm test           # one-shot
 npm run test:watch # watch mode
 ```
 
-71 tests, runs in under 2 seconds. No browser, no extension load.
+88 tests, runs in under 2 seconds. No browser, no extension load.
 
 ### E2E tests (Playwright)
 
@@ -660,7 +715,7 @@ npm run test:e2e                  # builds extension first, then runs suite
 npm run test:e2e:ui               # interactive UI
 ```
 
-8 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 4 multi-tab cases (page-triggered, script-triggered, openWindow popup, negative timeout). Runs in ~3-4 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
+11 tests — one full mega-fixture smoke, 3 fatal-path scenarios, 4 multi-tab cases (page-triggered, script-triggered, openWindow popup, negative timeout), 3 retry cases (baseline fail-fast, retry succeeds, covered-overlay clears). Runs in ~4-5 minutes. Headed mode is required (Chrome refuses extensions in headless), so CI on Linux needs `xvfb-run`.
 
 Three E2E-specific shims live in the test setup; touch them only if you understand the comments first:
 
@@ -676,7 +731,7 @@ Three E2E-specific shims live in the test setup; touch them only if you understa
 2. Run `phase4-fixture-smoke.json` from the dropdown (lives in your `automations/` folder).
 3. Watch the panel log: every action should report green, every result paragraph in the fixture should reflect the expected outcome.
 
-The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 22 sections (every action plus the multi-tab and script-injection cookbooks) plus 6 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo new-tab, Wikipedia/DuckDuckGo popup-window).
+The fixture also serves as a paste-and-run cookbook — each section has a 📋 Copy JSON button and an Expected outcome paragraph, covering 23 sections (every action plus multi-tab, script-injection, and retry cookbooks) plus 6 real-world examples (MUI, W3Schools, react-select, Shepherd, Wikipedia/DuckDuckGo new-tab, Wikipedia/DuckDuckGo popup-window).
 
 ---
 
@@ -688,7 +743,8 @@ These are *not* bugs — they're explicit scope choices.
 - **`evaluate` runs in the main frame only.** Reach into same-origin iframes from inside your expression (`document.querySelector('iframe').contentWindow.…`); cross-origin iframe evaluation isn't supported.
 - **`upload` requires absolute file paths.** Relative paths get rejected at action-handler time. Chrome resolves relative paths against an unpredictable cwd.
 - **No built-in credentials handling.** Secrets currently live in script `variables`, which means they're in the JSON. A `chrome.storage.local`-backed `{{secrets.password}}` mechanism is a future-phase candidate.
-- **No retry policy.** A flaky step fails the whole run. Phase 5 Batch 2 adds `retries?` + `retryDelay?` to every locator-using step.
+- **No network-event waits.** Today users `waitFor` on a result element; can't block until a specific XHR response lands. Phase 5 Batch 3 adds `waitForResponse`.
+- **No branching or loops.** Scripts are linear. Phase 5 Batch 4 adds `if` (with `xpathExists`) and `forEach` so a single script can iterate a list of customer IDs or take different paths based on page state.
 - **No screenshots-on-failure.** `Page.captureScreenshot` is a one-call wrapper away — declined for now (engine errors are detailed enough). Easy to add later if real demand surfaces.
 - **No recorder.** Scripts are written by hand. A click-recorder UI would be a major UX leap and a major implementation investment.
 - **One `<select>`-per-action.** `selectOption` works on one select at a time. Bulk operations require multiple steps.
@@ -708,10 +764,10 @@ Mapping commit history to milestones:
 - **Phase 4** — DX & error reporting: structured error messages, `describe` action, parse-time JSON validation, Vitest unit suite, Playwright E2E suite, mega-fixture cookbook (`all-content.html`), background folder refactor, this README.
 - **Phase 5 Batch 1** — Multi-tab orchestration: `tab` action (open / switchTo / waitForNew / close / next / previous), `Page` class restructured around a per-tab `TabAttachment` map so revisiting a tab is a pointer flip not a re-attach, origin stack for `close` to pop back, `windowId` threading, fixture section 21 + 22 (multi-tab + script injection), three new E2E specs.
 - **Phase 5 Batch 1.5** — Multi-window extension: `op: 'openWindow'` on the `tab` step, backed by `chrome.windows.create`. Supports `windowType: 'normal' | 'popup'` plus optional `width` / `height` / `left` / `top`. Reuses Batch 1's origin stack so `close` pops back to the source tab in the source window. `openTab` patched to use the current tab's `windowId` (not the engine's primary) so opens from inside a popup land in that popup. Six new validator tests, popup-window scenario added to fixture section 21, one new E2E case asserting cross-window behavior.
+- **Phase 5 Batch 2** — Step retry policy: `retries?: number` (default 0, capped at 5) and `retryDelay?: number` (default 500ms) on every locator-using step. Implemented as a `RetryFields` mixin extended by every retry-eligible interface, validated by a shared `validateRetryFields` helper. `interpreter.ts` wraps every step in `runStepWithRetry` with a decision tree that retries non-fatal errors and `FatalActionError` with reason `'covered'`, but short-circuits on `'disabled'`, `'read-only'`, `'no-match'`, `'not-a-select'`, and `'unknown'`. `FatalActionError` grew a typed `reason: FatalReason` field; all six throw sites in `page.ts` now pass the reason through. Eight validator unit tests, nine interpreter unit tests, fixture section 23 with two retry scenarios, three E2E cases (baseline fail-fast, retry succeeds, covered-overlay clears).
 
 Pending Phase 5 batches:
 
-- **Batch 2 — Step retry policy.** `retries?: number` (default 0) and `retryDelay?: number` (default 500ms) on every locator-using step. Non-fatal errors retry; `FatalActionError` (disabled / readonly) doesn't. Open question: whether `covered` retries by default. Validator update + interpreter wrap-step helper. ~3 hours.
 - **Batch 3 — Network waits.** New `waitForResponse` step backed by `Network.responseReceived` events. URL pattern auto-detects substring vs `/regex/flags`. Predicate-keyed waiter-set abstraction (reusable for Batch 1's `waitForNew`). `Network.enable` disables disk cache for the session — worth documenting. ~half day.
 - **Batch 4 — Conditional / branching.** `if` step with `xpathExists` + `then` + `else` + `timeoutMs`. `forEach` step with `items` + `as` + `do`. `runScript` becomes recursive; validator gets a depth cap (~20) to catch infinite nesting. Variable scoping: `forEach` writes the current item to `ctx.variables[step.as]`; saved outputs collide across iterations (last-wins) — namespace later if it bites. ~1 day.
 

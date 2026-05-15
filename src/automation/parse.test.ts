@@ -354,6 +354,76 @@ describe('validator: tab step', () => {
   });
 });
 
+describe('validator: retry fields (Batch 2)', () => {
+  it('accepts retries: 0 and retryDelay: 0', () => {
+    expect(
+      parseAutomation(
+        `{ "action": "click", "xpath": "//b", "retries": 0, "retryDelay": 0 }`,
+      ).steps,
+    ).toHaveLength(1);
+  });
+
+  it('accepts a full retry spec', () => {
+    expect(
+      parseAutomation(
+        `{ "action": "click", "xpath": "//b", "retries": 3, "retryDelay": 750 }`,
+      ).steps,
+    ).toHaveLength(1);
+  });
+
+  it('rejects non-integer retries', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "click", "xpath": "//b", "retries": 1.5 }`),
+    ).toThrow(/retries must be a non-negative integer/);
+  });
+
+  it('rejects negative retries', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "click", "xpath": "//b", "retries": -1 }`),
+    ).toThrow(/retries must be a non-negative integer/);
+  });
+
+  it('rejects retries > 5', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "click", "xpath": "//b", "retries": 6 }`),
+    ).toThrow(/retries capped at 5/);
+  });
+
+  it('rejects non-number retryDelay', () => {
+    expect(() =>
+      parseAutomation(
+        `{ "action": "click", "xpath": "//b", "retryDelay": "fast" }`,
+      ),
+    ).toThrow(/retryDelay must be a non-negative number/);
+  });
+
+  it('rejects negative retryDelay', () => {
+    expect(() =>
+      parseAutomation(`{ "action": "click", "xpath": "//b", "retryDelay": -100 }`),
+    ).toThrow(/retryDelay must be a non-negative number/);
+  });
+
+  it('applies across action types — fill, get, hover, tab', () => {
+    // Spot-check that the shared validator runs on multiple step types, not
+    // just click. (If validateRetryFields was wired into only one validator,
+    // this would silently pass for the others.)
+    expect(() =>
+      parseAutomation(
+        `{ "action": "fill", "xpath": "//x", "value": "v", "retries": 99 }`,
+      ),
+    ).toThrow(/retries capped at 5/);
+    expect(() =>
+      parseAutomation(`{ "action": "get", "xpath": "//x", "retries": -1 }`),
+    ).toThrow(/retries must be a non-negative integer/);
+    expect(() =>
+      parseAutomation(`{ "action": "hover", "xpath": "//x", "retryDelay": -1 }`),
+    ).toThrow(/retryDelay must be a non-negative number/);
+    expect(() =>
+      parseAutomation(`{ "action": "tab", "op": "close", "retries": 10 }`),
+    ).toThrow(/retries capped at 5/);
+  });
+});
+
 describe('registry consistency: stepValidators vs actions/index.ts', () => {
   it('every registered action has a validator', () => {
     for (const name of Object.keys(actions)) {

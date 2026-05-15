@@ -1039,6 +1039,149 @@
   </section>
 
   <!-- ===================================================================== -->
+  <section>
+    <h2>23. Retry policy <span class="tag">retries + retryDelay</span></h2>
+    <p class="use-case">Phase 5 Batch 2: every locator-using step accepts <code>retries</code> and <code>retryDelay</code>. Non-fatal failures and one specific kind of fatal failure (<code>covered</code>, an overlay-blocked click) trigger a retry; <code>disabled</code> / <code>read-only</code> / <code>no-match</code> / <code>not-a-select</code> do NOT retry because those states won't fix themselves. Two widgets below: a "becomes-clickable-after-1200ms" button that's hidden on load, and a "covered-clears-after-1500ms" overlay that auto-dismisses. Open each section's example, refresh the page (so the timer resets), then Run — the engine retries until the underlying condition is satisfied.</p>
+
+    <div class="widget" style="margin-bottom: 14px;">
+      <button type="button" id="late-btn" style="display: none;">Click me (appears after 1.2s)</button>
+      <p class="result" id="result-late">not clicked</p>
+    </div>
+
+    <div class="widget" style="position: relative; display: inline-block;">
+      <!--
+        IDs prefixed with `retry-` so we don't collide with Section 10's
+        permanent overlay-fatal demo (which uses `covered-btn` / `result-covered`).
+        That demo's overlay never clears — would defeat the retry policy demo.
+      -->
+      <button type="button" id="retry-covered-btn">Covered button</button>
+      <div id="retry-covered-overlay" style="position: absolute; inset: 0; background: rgba(220, 60, 60, 0.55); z-index: 10;"></div>
+      <p class="result" id="retry-result-covered" style="margin-top: 6px;">not clicked</p>
+    </div>
+
+    <div class="scenarios">
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Retry: becomes-clickable-after-1200ms (succeeds with retries: 3)",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetRetryDemo()" },
+    {
+      "action": "click",
+      "xpath": "//button[@id='late-btn']",
+      "timeoutMs": 500,
+      "retries": 3,
+      "retryDelay": 500
+    },
+    { "action": "get", "xpath": "//p[@id='result-late']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> step 1 invokes <code>__resetRetryDemo()</code> which hides the button and starts a fresh 1.2s timer. Step 2's first click attempt fails (button still hidden), waits 500ms, retries, fails again, retries — by attempt 3 or 4 the <code>setTimeout</code> has fired and the button is visible. Side panel log: <code>Attempt 1/4 failed: ... Retrying in 500ms…</code> repeats until <code>Step click succeeded on retry 2/3</code> (or similar). Output <code>out = "clicked"</code>. Re-runnable without a page reload — the reset call rebuilds the timer each time.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Retry: covered overlay clears after 1500ms",
+  "tag": "action",
+  "steps": [
+    { "action": "evaluate", "expression": "window.__resetRetryDemo()" },
+    {
+      "action": "click",
+      "xpath": "//button[@id='retry-covered-btn']",
+      "timeoutMs": 1000,
+      "retries": 3,
+      "retryDelay": 700
+    },
+    { "action": "get", "xpath": "//p[@id='retry-result-covered']", "property": "textContent", "saveAs": "out" }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> step 1 invokes <code>__resetRetryDemo()</code> which (re)creates the overlay and starts a fresh 1.5s timer. Step 2's first click attempt hits the overlay and gets a <code>FatalActionError</code> with reason <code>covered</code>. Because Batch 2 treats <code>covered</code> as retryable, the engine waits 700ms then tries again. By attempt 2 or 3 the overlay's auto-dismiss <code>setTimeout</code> has removed it, and the click lands on the underlying button. Output <code>out = "clicked"</code>. Re-runnable without a page reload. Contrast: a fatal click without retries fails immediately — try removing <code>retries: 3</code> from the JSON to see the difference. (Section 10's permanent fatal-path demo uses <code>covered-btn</code> without the <code>retry-</code> prefix; that overlay never clears.)</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-controls"><button type="button" class="copy-btn">📋 Copy JSON</button></div>
+<pre>{
+  "name": "Retry: validator caps retries at 5",
+  "tag": "action",
+  "steps": [
+    {
+      "action": "click",
+      "xpath": "//button[@id='retry-covered-btn']",
+      "retries": 99
+    }
+  ]
+}</pre>
+        <p class="expected"><strong>Expected:</strong> parse-time failure. The side panel shows <code>Step 1: retries capped at 5 (got 99)...</code> before the debugger ever attaches. Worst-case wall-clock at 5 retries × 20s timeout is already ~2 minutes per step; anything more usually means the script needs restructuring instead.</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        // Click handlers are wired once at page load. The TIMERS that actually
+        // make the late button appear / overlay clear are started by an
+        // explicit window.__resetRetryDemo() call — invoked from the
+        // cookbook's `evaluate` step. That way the demo is repeatable without
+        // a manual page reload, and the timers always fire mid-script (not
+        // before the user has finished pasting JSON).
+        var lateBtn = document.getElementById('late-btn');
+        var resultLate = document.getElementById('result-late');
+        if (lateBtn && resultLate) {
+          lateBtn.addEventListener('click', function () {
+            resultLate.textContent = 'clicked';
+          });
+        }
+
+        var retryWidget = lateBtn ? lateBtn.closest('section') : null;
+        var coveredBtn = document.getElementById('retry-covered-btn');
+        if (coveredBtn) {
+          coveredBtn.addEventListener('click', function () {
+            var r = document.getElementById('retry-result-covered');
+            if (r) r.textContent = 'clicked';
+          });
+        }
+
+        /**
+         * Reset both widgets to their initial state and (re)start the timers.
+         * Called by the cookbook's evaluate step at the top of each retry
+         * scenario, so the timing is bound to script execution rather than
+         * page load. Returns 'reset' so the saved output proves it ran.
+         */
+        window.__resetRetryDemo = function () {
+          // Late button: hide, reset result, start a fresh 1200ms timer.
+          if (lateBtn) lateBtn.style.display = 'none';
+          if (resultLate) resultLate.textContent = 'not clicked';
+          setTimeout(function () {
+            if (lateBtn) lateBtn.style.display = 'inline-block';
+          }, 1200);
+
+          // Covered overlay: recreate if it was already removed by a prior
+          // run, reset result, start a fresh 1500ms timer to remove it again.
+          if (coveredBtn) {
+            var parent = coveredBtn.parentNode;
+            var existing = document.getElementById('retry-covered-overlay');
+            if (!existing && parent) {
+              existing = document.createElement('div');
+              existing.id = 'retry-covered-overlay';
+              existing.style.cssText =
+                'position:absolute;inset:0;background:rgba(220,60,60,0.55);z-index:10;';
+              parent.insertBefore(existing, coveredBtn.nextSibling);
+            }
+            var r = document.getElementById('retry-result-covered');
+            if (r) r.textContent = 'not clicked';
+            setTimeout(function () {
+              var o = document.getElementById('retry-covered-overlay');
+              if (o && o.parentNode) o.parentNode.removeChild(o);
+            }, 1500);
+          }
+          return 'reset';
+        };
+      })();
+    </script>
+  </section>
+
+  <!-- ===================================================================== -->
   <!-- ============ REAL-WORLD EXAMPLES (external sites) =================== -->
   <!-- ===================================================================== -->
   <section style="background:#fffbe6;border-color:#d6b656">

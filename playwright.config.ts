@@ -33,7 +33,11 @@ export default defineConfig({
   use: {
     headless: false,
     actionTimeout: 15_000,
-    trace: 'on-first-retry',
+    // `retain-on-failure` captures traces on every failure (not just retries),
+    // so the first local failure has the artifact already. The on-first-retry
+    // default required CI-style retries to ever populate, which made local
+    // debugging painful.
+    trace: 'retain-on-failure',
     video: 'retain-on-failure',
   },
 });

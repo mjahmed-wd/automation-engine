@@ -19,6 +19,31 @@ export interface BaseStep {
 }
 
 /**
+ * Retry fields (Phase 5 Batch 2) — mixed into every locator-using step.
+ *
+ * Why a mixin rather than fields on `BaseStep`: not every step is retry-eligible.
+ * `wait` is a pure sleep (nothing to retry), `goto` and `dialog` are one-shot
+ * navigation/arming. Keeping the fields out of those interfaces makes typos
+ * (`{"action":"wait","ms":100,"retries":3}`) catch at parse time.
+ *
+ * Retry semantics:
+ *   - `retries` is the number of ADDITIONAL attempts after the first. Total
+ *     attempts = retries + 1. Default 0 (current single-attempt behavior).
+ *   - `retryDelay` is milliseconds between attempts. Default 500.
+ *   - `FatalActionError` with reason `'disabled'`, `'read-only'`, `'no-match'`,
+ *     `'not-a-select'`, or `'unknown'` DOES NOT retry — those states won't
+ *     fix themselves.
+ *   - `FatalActionError` with reason `'covered'` DOES retry by default —
+ *     toast banners, loading spinners, and modal scrims routinely self-dismiss.
+ *   - Validator caps `retries` at 5 to prevent runaway scripts (worst-case
+ *     time per step ~= (retries+1) × timeoutMs + retries × retryDelay).
+ */
+export interface RetryFields {
+  retries?: number;
+  retryDelay?: number;
+}
+
+/**
  * Navigate the active tab. The default behavior waits for `tabs.onUpdated`
  * to report `'complete'` — but on modern SPAs that fires when the HTML
  * shell loads, not when the framework has mounted the page content. For
@@ -39,7 +64,7 @@ export interface GotoStep extends BaseStep {
   waitForTimeoutMs?: number;
 }
 
-export interface FillStep extends BaseStep {
+export interface FillStep extends BaseStep, RetryFields {
   action: 'fill';
   xpath: string;
   value: string;
@@ -62,7 +87,7 @@ export interface FillStep extends BaseStep {
  * If `regex` matches, the first capture group is returned; otherwise the
  * full match. No match → empty string.
  */
-export interface GetStep extends BaseStep {
+export interface GetStep extends BaseStep, RetryFields {
   action: 'get';
   xpath: string;
   attribute?: string;
@@ -75,7 +100,7 @@ export interface GetStep extends BaseStep {
   timeoutMs?: number;
 }
 
-export interface ClickStep extends BaseStep {
+export interface ClickStep extends BaseStep, RetryFields {
   action: 'click';
   xpath: string;
   pierceClosed?: boolean;
@@ -88,7 +113,7 @@ export interface WaitStep extends BaseStep {
   ms: number;
 }
 
-export interface WaitForStep extends BaseStep {
+export interface WaitForStep extends BaseStep, RetryFields {
   action: 'waitFor';
   xpath: string;
   timeoutMs?: number;
@@ -106,7 +131,7 @@ export interface WaitForStep extends BaseStep {
  * keystroke; if omitted, the keystroke goes to whatever has focus already
  * (typically the input most recently `fill`ed).
  */
-export interface PressStep extends BaseStep {
+export interface PressStep extends BaseStep, RetryFields {
   action: 'press';
   xpath?: string;
   key: string;
@@ -129,7 +154,7 @@ export interface PressStep extends BaseStep {
  *
  *   { "action": "describe", "xpath": "//button", "saveAs": "buttons" }
  */
-export interface DescribeStep extends BaseStep {
+export interface DescribeStep extends BaseStep, RetryFields {
   action: 'describe';
   xpath: string;
   /** Save the result as a JSON string to ctx.outputs[saveAs]. */
@@ -183,7 +208,7 @@ export interface DialogStep extends BaseStep {
  *
  *   { "action": "hover", "xpath": "//div[@class='row']" }
  */
-export interface HoverStep extends BaseStep {
+export interface HoverStep extends BaseStep, RetryFields {
   action: 'hover';
   xpath: string;
   pierceClosed?: boolean;
@@ -209,7 +234,7 @@ export interface HoverStep extends BaseStep {
  *   { "action": "selectOption", "xpath": "//select[@id='country']", "label": "Bangladesh" }
  *   { "action": "selectOption", "xpath": "//select[@multiple]", "value": ["red", "blue"] }
  */
-export interface SelectOptionStep extends BaseStep {
+export interface SelectOptionStep extends BaseStep, RetryFields {
   action: 'selectOption';
   xpath: string;
   value?: string | string[];
@@ -237,7 +262,7 @@ export interface SelectOptionStep extends BaseStep {
  *
  *   { "action": "upload", "xpath": "//input[@type='file']", "files": "/Users/me/sample.csv" }
  */
-export interface UploadStep extends BaseStep {
+export interface UploadStep extends BaseStep, RetryFields {
   action: 'upload';
   xpath: string;
   files: string | string[];
@@ -264,7 +289,7 @@ export interface UploadStep extends BaseStep {
  * Frame: main frame only in this iteration. For same-origin iframes, reach
  * across in your expression (`document.querySelector('iframe').contentWindow.…`).
  */
-export interface EvaluateStep extends BaseStep {
+export interface EvaluateStep extends BaseStep, RetryFields {
   action: 'evaluate';
   expression: string;
   saveAs?: string;
@@ -309,7 +334,7 @@ export interface EvaluateStep extends BaseStep {
  *   { "action": "tab", "op": "waitForNew", "urlMatches": "/customers/" }
  *   { "action": "tab", "op": "close" }
  */
-export interface TabStep extends BaseStep {
+export interface TabStep extends BaseStep, RetryFields {
   action: 'tab';
   op:
     | 'open'
