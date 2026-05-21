@@ -88,7 +88,7 @@ export const test = base.extend<ExtensionFixtures>({
     const panel = await context.newPage();
     await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
     // Wait for the App component to render (textarea + Run button visible).
-    await panel.locator('.pane.active .json-editor').waitFor({ timeout: 10_000 });
+    await panel.locator('textarea.json-editor').waitFor({ timeout: 10_000 });
     await use(panel);
     await panel.close().catch(() => {});
   },

@@ -65,6 +65,7 @@ test.describe('waitForResponse (Batch 3)', () => {
         {
           action: 'waitForResponse',
           urlMatches: '/json-echo',
+          status: 200,
           timeoutMs: 5000,
           saveBody: 'body',
         },

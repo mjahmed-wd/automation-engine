@@ -571,10 +571,20 @@ export function substituteXPath(template: string, ctx: ExecutionContext): string
     function (match, quote, name) {
       if (!(name in ctx.outputs) && !(name in ctx.variables)) return match;
       const value = String(ctx.outputs[name] ?? ctx.variables[name]);
-      // Preserve surrounding quotes if present: '{{var}}' -> 'concat(...)', "{{var}}" -> "concat(...)"
-      // If no surrounding quotes, return the literal directly (var was unquoted in template).
-      const literal = xpathStringLiteral(value);
-      return quote ? quote + literal + quote : literal;
+      // If template has surrounding quotes, just escape the value for that quote type.
+      // xpathStringLiteral adds its own quotes, so only use it when there's no surrounding quote.
+      if (quote === "'") {
+        // For single-quoted context, escape single quotes as "'"
+        if (!value.includes("'")) return quote + value + quote;
+        return quote + value.replace(/'/g, "\"'\"") + quote;
+      }
+      if (quote === '"') {
+        // For double-quoted context, escape double quotes as ""
+        if (!value.includes('"')) return quote + value + quote;
+        return quote + value.replace(/"/g, '""') + quote;
+      }
+      // No surrounding quotes — let xpathStringLiteral add them.
+      return xpathStringLiteral(value);
     },
   );
 }

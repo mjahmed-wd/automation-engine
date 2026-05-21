@@ -1310,7 +1310,7 @@
           bJson.addEventListener('click', function () {
             var json = encodeURIComponent('{"ok":true,"id":42,"label":"hello"}');
             fetchAndShow(
-              'data:application/json;charset=utf-8,' + json + '#/json-echo',
+              'data:application/json;charset=utf-8,/json-echo,' + json,
               '/json-echo',
             );
           });

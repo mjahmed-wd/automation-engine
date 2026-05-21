@@ -22,9 +22,8 @@ export async function forceFocus(context: BrowserContext, page: Page): Promise<v
   await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true });
 }
 
-const ACTIVE_PANE = '.pane.active';
-const JSON_EDITOR = `${ACTIVE_PANE} .json-editor`;
-const RUN_BUTTON = `${ACTIVE_PANE} .run`;
+const JSON_EDITOR = `textarea.json-editor`;
+const RUN_BUTTON = `.run`;
 const LOG_LINE = '.log .log-line .msg';
 
 /**
