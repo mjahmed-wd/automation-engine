@@ -568,10 +568,13 @@ export function substituteRaw(str: string, ctx: ExecutionContext): string {
 export function substituteXPath(template: string, ctx: ExecutionContext): string {
   return template.replace(
     /(['"])?\{\{(\w+)\}\}\1?/g,
-    function (match, _quote, name) {
+    function (match, quote, name) {
       if (!(name in ctx.outputs) && !(name in ctx.variables)) return match;
       const value = String(ctx.outputs[name] ?? ctx.variables[name]);
-      return xpathStringLiteral(value);
+      // Preserve surrounding quotes if present: '{{var}}' -> 'concat(...)', "{{var}}" -> "concat(...)"
+      // If no surrounding quotes, return the literal directly (var was unquoted in template).
+      const literal = xpathStringLiteral(value);
+      return quote ? quote + literal + quote : literal;
     },
   );
 }

@@ -351,6 +351,14 @@ export function buildResolveExpression(locator: Locator): string {
     if (!el) {
       return { ok: false, frame: location.href, inputs: document.querySelectorAll('input').length };
     }
+    // DEBUG: log what element was found
+    const _dbg = {
+      tag: el.tagName,
+      class: el.className,
+      text: el.textContent?.substring(0, 50),
+      xpath: ${xpLit}
+    };
+    console.log('[buildResolveExpression] found:', _dbg);
     if (!visible(el)) {
       return { ok: false, frame: location.href, inputs: document.querySelectorAll('input').length };
     }
@@ -392,6 +400,11 @@ export function buildResolveExpression(locator: Locator): string {
       tag: el.tagName,
       name: el.name || el.id || '',
       isMain: window === window.top,
+      // DEBUG: include element details for troubleshooting
+      _debug: {
+        class: el.className,
+        text: el.textContent?.substring(0, 30)
+      }
     };
   })()`;
 }

@@ -21,7 +21,8 @@ Built on [WXT](https://wxt.dev/) + React 19 + TypeScript. XPath-only locators wi
 ## Table of contents
 
 1. [Quick start](#quick-start)
-2. [Script structure](#script-structure)
+2. [What's new](#whats-new)
+3. [Script structure](#script-structure)
 3. [Action reference](#action-reference)
 4. [Retry policy](#retry-policy)
 5. [Script injection via `evaluate`](#script-injection-via-evaluate)
@@ -33,7 +34,7 @@ Built on [WXT](https://wxt.dev/) + React 19 + TypeScript. XPath-only locators wi
 11. [Architecture (for contributors)](#architecture-for-contributors)
 12. [Testing](#testing)
 13. [Known limitations & non-goals](#known-limitations--non-goals)
-14. [Phases history](#phases-history)
+14. [What's new](./docs/release-notes.md)
 
 ---
 
@@ -69,6 +70,14 @@ Open any site (e.g., `example.com`), then paste this into the side panel:
 The log shows `Got "Example Domain" → title`, and the saved output renders below the editor.
 
 For a comprehensive walkthrough of every action with copy-paste JSON and expected outcomes, open `test-fixtures/all-content.html` in the active tab — it's a self-documenting cookbook with **25 fixture sections + 7 real-world examples** covering every action, every locator path, the multi-tab/window flow, script injection, the retry policy, and network waits.
+
+---
+
+## What's new
+
+**[0.0.2](./docs/release-notes.md#002---2025-01-21)** — Page class refactored from 2,342 → 991 lines (58% reduction). New modules: ActionDescriptor pattern, InputExecutor, UploadHandler, SelectHandler, EventRouter, Navigator.
+
+See [docs/release-notes.md](./docs/release-notes.md) for full version history.
 
 ---
 

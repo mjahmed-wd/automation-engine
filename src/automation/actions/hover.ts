@@ -1,7 +1,6 @@
 import type { ExecutionContext, HoverStep } from '../schema';
 import { resolveLocator } from '../schema';
 import type { Page } from '../page';
-import { withLocatorContext } from '../errors';
 
 /**
  * Hover over an element. Used as a precondition for "hover reveals
@@ -13,9 +12,13 @@ import { withLocatorContext } from '../errors';
  */
 export async function hoverAction(step: HoverStep, ctx: ExecutionContext, page: Page) {
   const locator = resolveLocator(step, ctx);
-  const result = await withLocatorContext(
-    { action: step.action, original: step.xpath, resolved: locator.xpath },
-    () => page.hover(locator, { pierceClosed: step.pierceClosed, timeoutMs: step.timeoutMs }),
-  );
+  const result = await page.executeAction({
+    name: step.action,
+    mode: 'hover',
+    locator,
+    originalXPath: step.xpath,
+    timeoutMs: step.timeoutMs,
+    pierceClosed: step.pierceClosed,
+  });
   ctx.log('success', `Hovered ${result.tag ?? 'element'} in ${result.frame}`);
 }

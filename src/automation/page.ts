@@ -29,71 +29,32 @@
 import type { Locator, LogFn } from './schema';
 import {
   buildActionExpression,
-  buildCallFunctionExpression,
   buildDescribeExpression,
   buildResolveExpression,
   type GetOptions,
   type Mode,
 } from './locator';
-import { parseUrlMatcher, waitForTabComplete } from './tabs';
-import { EventWaiter } from './event-waiter';
+import { CDPPort } from './cdp-port';
+import { TabManager } from './tab-manager';
+import { NetworkMonitor } from './network-monitor';
+import { DOMExecutor, FatalActionError, anyClosedShadow } from './dom-executor';
+import { InputExecutor } from './input-executor';
+import { UploadHandler } from './upload-handler';
+import { SelectHandler } from './select-handler';
+import { EventRouter } from './event-router';
+import { Navigator } from './navigator';
+import { serializeEvalResult } from './serialization';
+import type { ActionDescriptor, ActionResult } from './action-descriptor';
+import type { NetworkResponse } from './network-monitor';
+
+// Re-exports for action handlers and interpreter
+export { FatalActionError } from './dom-executor';
+export type FatalReason = 'disabled' | 'read-only' | 'covered' | 'no-match' | 'not-a-select' | 'unknown';
+export type { ActionDescriptor, ActionResult } from './action-descriptor';
 
 type Target = chrome.debugger.Debuggee;
 
-const PROTOCOL_VERSION = '1.3';
 const DEFAULT_SEARCH_TIMEOUT_MS = 20_000;
-const CHILD_CMD_TIMEOUT_MS = 10_000;
-
-/**
- * Per-tab CDP state. We hold one of these per attached tab so multi-tab
- * orchestration (open side tab → look up → close → come back) doesn't pay
- * a fresh attach round-trip when the script returns to a tab we've already
- * been on. Existing single-tab logic reads through the `current` getter and
- * doesn't need to know the map exists.
- */
-interface TabAttachment {
-  target: Target;
-  childSessions: Map<string, any>;
-  cdpReadyChildren: Set<string>;
-  hasClosedShadow: boolean;
-  /**
-   * One-shot response for the next native dialog on this tab. Scoped per-tab
-   * because a `dialog` arming on tab A shouldn't fire for tab B's confirm.
-   */
-  nextDialogResponse: { accept: boolean; promptText: string } | null;
-  /**
-   * Buffer of recent Network.responseReceived events for this tab. Populated
-   * by the Page's CDP event router; consumed by `waitForResponse`. Per-tab
-   * because closing one tab shouldn't affect another tab's pending response
-   * waits, and event volumes can be high enough that mixing tabs would
-   * make matching ambiguous.
-   */
-  networkWaiter: EventWaiter<NetworkResponse>;
-  /**
-   * Bookkeeping for `Network.responseReceived` — the event params don't
-   * include the HTTP method, so we track it via the earlier
-   * `Network.requestWillBeSent` keyed by `requestId`. Pruned periodically
-   * to avoid growing unbounded for long sessions with many XHRs.
-   */
-  requestMethodById: Map<string, { method: string; at: number }>;
-}
-
-/**
- * Normalised shape of a network response event, surfaced to the
- * `waitForResponse` action handler.
- */
-export interface NetworkResponse {
-  requestId: string;
-  url: string;
-  status: number;
-  /** HTTP method (uppercase), reconstructed from the prior
-   *  `Network.requestWillBeSent`. Empty string if we missed the request
-   *  event (rare; happens for tabs the engine attached to mid-fetch). */
-  method: string;
-  /** Whether the response body has been read out via DOM body fetch.
-   *  Not populated until `Network.getResponseBody` resolves. */
-  bodyRead?: boolean;
-}
 
 export interface FrameResult {
   ok: boolean;
@@ -133,159 +94,71 @@ export interface DescribeResult {
   matches: DescribeMatch[];
 }
 
-/**
- * Reason codes for `FatalActionError`. Used by the Batch 2 retry policy to
- * decide whether retrying makes sense. Stable states (disabled / read-only /
- * no-match / not-a-select / unknown) won't fix themselves and don't retry;
- * `covered` is transient (toast banners, loading scrims) and retries by
- * default. Add new reasons here when the engine grows new fatal categories.
- */
-export type FatalReason =
-  | 'disabled'
-  | 'read-only'
-  | 'covered'
-  | 'no-match'
-  | 'not-a-select'
-  | 'unknown';
-
-/**
- * Thrown when the in-page function signals `fatal:true`. We use a typed error
- * so `runAction` can distinguish "didn't find it, try CDP" from "found it but
- * the page state forbids the action — stop searching." Carries a `reason`
- * field so `runStepWithRetry` (in interpreter.ts) can decide whether to
- * retry without parsing the message.
- */
-export class FatalActionError extends Error {
-  readonly fatal = true as const;
-  readonly reason: FatalReason;
-  constructor(message: string, reason: FatalReason = 'unknown') {
-    super(message);
-    this.name = 'FatalActionError';
-    this.reason = reason;
-  }
-}
-
-/**
- * Map the in-page IIFE's `reason` string (untyped) onto our typed
- * `FatalReason` enum. Anything not on the list collapses to `'unknown'` so
- * the retry policy in interpreter.ts can still decide deterministically.
- */
-function coerceFatalReason(s: string | undefined): FatalReason {
-  switch (s) {
-    case 'disabled':
-    case 'read-only':
-    case 'covered':
-    case 'no-match':
-    case 'not-a-select':
-      return s;
-    default:
-      return 'unknown';
-  }
-}
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class Page {
   readonly windowId: number | undefined;
   private readonly log: LogFn;
-  /**
-   * Every tab we've ever attached the debugger to during this run. We don't
-   * detach on tab switch — that costs ~1s of attach setup to re-enter. Instead
-   * we keep all sessions live and flip `currentTabId` to point at the active
-   * one. Detached only on script end via `detach()`.
-   */
-  private readonly attachments = new Map<number, TabAttachment>();
-  /**
-   * Origin stack for `tab close`. Every op that activates a different tab
-   * pushes the previously-current tabId; `close` pops and reactivates. Empty
-   * stack at close → focus falls to whatever Chrome decides (typically the
-   * adjacent tab in the strip).
-   */
-  private readonly originStack: number[] = [];
-  private readonly pending = new Map<
-    number,
-    { resolve: (v: any) => void; reject: (e: Error) => void }
-  >();
-  /** Active tab pointer. All `this.tabTarget` / `this.childSessions` /
-   *  `this.hasClosedShadow` / `this.nextDialogResponse` reads route through
-   *  the attachment for THIS tabId. */
-  private currentTabId!: number;
-  private nextMsgId = 1;
-  private listener?: (
-    source: chrome.debugger.Debuggee,
-    method: string,
-    params?: any,
-  ) => void;
-  /**
-   * Always-on `chrome.tabs.onCreated` / `onUpdated` listeners populate this
-   * waiter at Page lifetime. `waitForNewTab` consumes from it, which means
-   * events that fired BEFORE the await began still resolve (race-tolerant
-   * via the ringbuffer). Replaces the on-demand listener pattern that lived
-   * in tabs.ts before Batch 3.
-   */
-  private readonly tabEventWaiter = new EventWaiter<chrome.tabs.Tab>({
-    windowMs: 30_000,
-    maxBufferSize: 50,
-  });
-  private tabCreatedListener?: (tab: chrome.tabs.Tab) => void;
-  private tabUpdatedListener?: (
-    tabId: number,
-    info: chrome.tabs.TabChangeInfo,
-    tab: chrome.tabs.Tab,
-  ) => void;
+  private readonly cdpPort = new CDPPort();
+  private readonly tabManager: TabManager;
+  private readonly networkMonitor: NetworkMonitor;
+  private readonly domExecutor: DOMExecutor;
+  private readonly inputExecutor: InputExecutor;
+  private readonly uploadHandler: UploadHandler;
+  private readonly selectHandler: SelectHandler;
+  private readonly eventRouter: EventRouter;
+  private readonly navigator: Navigator;
   private detached = false;
 
-  /** Public view of the active tab. Getter (not field) because it changes
-   *  when the script does `tab switchTo` / `tab open` / `tab close`. */
+  /** Public view of the active tab. */
   get tabId(): number {
-    return this.currentTabId;
+    return this.tabManager.getCurrentTabId();
   }
 
-  /**
-   * Backing accessor for per-tab state. Existing code that does
-   * `this.tabTarget` / `this.hasClosedShadow` / `this.childSessions` /
-   * `this.cdpReadyChildren` / `this.nextDialogResponse` reads through this
-   * implicitly — the getters/setters below forward to whichever attachment
-   * is currently active. The dozens of `this.tabTarget` call sites elsewhere
-   * in this file work unchanged.
-   */
-  private get attachment(): TabAttachment {
-    const a = this.attachments.get(this.currentTabId);
-    if (!a) {
-      throw new Error(
-        `Page: internal — no attachment for current tab ${this.currentTabId}.`,
-      );
-    }
-    return a;
-  }
+  /** Accessors for current tab's CDP state — delegate to TabManager. */
   private get tabTarget(): Target {
-    return this.attachment.target;
+    return this.tabManager.tabTarget;
   }
   private get childSessions(): Map<string, any> {
-    return this.attachment.childSessions;
+    return this.tabManager.childSessions;
   }
   private get cdpReadyChildren(): Set<string> {
-    return this.attachment.cdpReadyChildren;
+    return this.tabManager.cdpReadyChildren;
   }
   private get hasClosedShadow(): boolean {
-    return this.attachment.hasClosedShadow;
+    return this.tabManager.hasClosedShadow;
   }
   private set hasClosedShadow(v: boolean) {
-    this.attachment.hasClosedShadow = v;
-  }
-  private get nextDialogResponse(): { accept: boolean; promptText: string } | null {
-    return this.attachment.nextDialogResponse;
-  }
-  private set nextDialogResponse(
-    v: { accept: boolean; promptText: string } | null,
-  ) {
-    this.attachment.nextDialogResponse = v;
+    this.tabManager.hasClosedShadow = v;
   }
 
-  private constructor(tabId: number, windowId: number | undefined, log: LogFn) {
-    this.currentTabId = tabId;
+  private constructor(_tabId: number, windowId: number | undefined, log: LogFn) {
     this.windowId = windowId;
     this.log = log;
+    this.tabManager = new TabManager({ windowId, log }, this.cdpPort, () => this.detectClosedShadow());
+    this.networkMonitor = new NetworkMonitor(log, this.cdpPort);
+    this.domExecutor = new DOMExecutor(log, this.cdpPort);
+    this.inputExecutor = new InputExecutor(log, this.cdpPort);
+    this.uploadHandler = new UploadHandler(log, this.cdpPort);
+    this.selectHandler = new SelectHandler(log, this.cdpPort);
+    this.eventRouter = new EventRouter(
+      log,
+      this.cdpPort,
+      this.networkMonitor,
+      (tabId) => this.tabManager.attachments.get(tabId),
+    );
+    this.navigator = new Navigator({
+      tabId: this.tabId,
+      log,
+      navigate: async (url) => {
+        await chrome.tabs.update(this.tabId, { url, active: true });
+      },
+      waitForLoad: (timeoutMs) => this.waitForLoad(timeoutMs),
+      getHasClosedShadow: () => this.hasClosedShadow,
+      setHasClosedShadow: (v) => { this.hasClosedShadow = v; },
+      detectClosedShadow: () => this.detectClosedShadow(),
+      waitFor: (locator, opts) => this.waitFor(locator, opts),
+    });
   }
 
   static async create(
@@ -294,107 +167,21 @@ export class Page {
     log: LogFn,
   ): Promise<Page> {
     const page = new Page(tabId, windowId, log);
-    await page.init();
+    await page.init(tabId);
     return page;
   }
 
-  private async init() {
-    // Listener is registered once for the lifetime of this Page and routes
-    // events to the attachment for whichever source.tabId fired them. That
-    // way a second tab we attach to later doesn't need its own listener;
-    // we just need its tabId to be in `this.attachments`.
-    this.listener = (source, method, params) => {
-      if (source.tabId === undefined) return;
-      if (!this.attachments.has(source.tabId)) return;
-      this.onEvent(source.tabId, method, params);
-    };
-    chrome.debugger.onEvent.addListener(this.listener);
+  private async init(initialTabId: number) {
+    // CDPPort routes all CDP events. We register a callback that forwards
+    // to per-tab handlers (dialog, network, etc.).
+    this.cdpPort.onEvent((target, method, params) => {
+      const tabId = target.tabId;
+      if (tabId === undefined) return;
+      if (!this.tabManager.attachments.has(tabId)) return;
+      this.onEvent(tabId, method, params);
+    });
 
-    // Always-on chrome.tabs listeners — populate the tabEventWaiter so that
-    // `waitForNewTab` is race-tolerant. The waiter's ringbuffer holds the
-    // last 30s of tab events, so a tab opened synchronously inside the
-    // prior step's window.open call still resolves the await.
-    this.tabCreatedListener = (tab) => {
-      this.tabEventWaiter.emit(tab);
-    };
-    this.tabUpdatedListener = (_tabId, _info, tab) => {
-      // We re-emit on every onUpdated too — URL transitions (about:blank →
-      // real URL) are common right after onCreated, and the predicate
-      // typically gates on URL.
-      this.tabEventWaiter.emit(tab);
-    };
-    chrome.tabs.onCreated.addListener(this.tabCreatedListener);
-    chrome.tabs.onUpdated.addListener(this.tabUpdatedListener);
-
-    await this.attachTab(this.currentTabId);
-  }
-
-  /**
-   * Attach the debugger to `tabId`, register a fresh `TabAttachment`, enable
-   * Runtime/DOM/Page + auto-attach for sub-targets, and run the closed-shadow
-   * detect. Used both by `init` for the initial tab and by `openTab` /
-   * `switchToTab` / `waitForNewTab` to bring up additional tabs.
-   *
-   * Idempotent: if `tabId` is already attached, just flips `currentTabId` and
-   * returns. Same-tab re-attach would otherwise fail with "Another debugger
-   * is already attached" anyway.
-   */
-  private async attachTab(tabId: number): Promise<void> {
-    if (this.attachments.has(tabId)) {
-      this.currentTabId = tabId;
-      return;
-    }
-    const target: Target = { tabId };
-    const attachment: TabAttachment = {
-      target,
-      childSessions: new Map(),
-      cdpReadyChildren: new Set(),
-      hasClosedShadow: false,
-      nextDialogResponse: null,
-      networkWaiter: new EventWaiter<NetworkResponse>({
-        windowMs: 30_000,
-        maxBufferSize: 200, // network event volume can be higher than tab events
-      }),
-      requestMethodById: new Map(),
-    };
-    // Register BEFORE attaching so the event listener can route any events
-    // that fire during attach (Target.attachedToTarget for pre-existing
-    // iframes arrives almost immediately after setAutoAttach).
-    this.attachments.set(tabId, attachment);
-    this.currentTabId = tabId;
-
-    this.log('info', `Attaching debugger to tab ${tabId}…`);
-    try {
-      await this.attach(target);
-      await this.sendCmd(target, 'Runtime.enable');
-      await this.sendCmd(target, 'DOM.enable').catch(() => {});
-      // Required to receive Page.javascriptDialogOpening events. Without
-      // Page.enable, native alert()/confirm()/prompt() would block the page
-      // indefinitely and stall the run loop.
-      await this.sendCmd(target, 'Page.enable').catch(() => {});
-      // Network domain — backs the `waitForResponse` action (Batch 3).
-      // Caveat: enabling Network disables Chrome's disk cache for the
-      // attached debugger session. Real impact: cold-load asset fetches
-      // are slower while the engine is attached. Fine for automation, but
-      // worth knowing if a script behaves differently with vs without the
-      // engine attached.
-      await this.sendCmd(target, 'Network.enable').catch(() => {});
-      await this.sendCmd(target, 'Target.setAutoAttach', {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: false,
-      });
-
-      await sleep(800);
-
-      // Initial closed-shadow detection so we can skip the fast path on pages
-      // like Shepherd that mount closed shadow at load time.
-      await this.detectClosedShadow();
-    } catch (err) {
-      // Don't leak a half-initialized attachment on failure.
-      this.attachments.delete(tabId);
-      throw err;
-    }
+    await this.tabManager.init(initialTabId);
   }
 
   /**
@@ -406,7 +193,7 @@ export class Page {
    */
   private async detectClosedShadow(): Promise<void> {
     try {
-      const res = await this.sendCmd<any>(this.tabTarget, 'DOM.getDocument', {
+      const res = await this.cdpPort.sendCommand<any>(this.tabTarget, 'DOM.getDocument', {
         depth: -1,
         pierce: true,
       });
@@ -426,137 +213,23 @@ export class Page {
   }
 
   private onEvent(sourceTabId: number, method: string, params: any) {
-    // Per-tab routing: writes go to the attachment that fired the event, NOT
-    // the current attachment. A dialog on a backgrounded tab still consumes
-    // that tab's arming, not the active tab's. (This matters once `tab close`
-    // pops back to the origin — pending events from the closing tab still get
-    // delivered briefly before detach.)
-    const attachment = this.attachments.get(sourceTabId);
-    if (!attachment) return;
-
-    if (method === 'Target.attachedToTarget') {
-      attachment.childSessions.set(params.sessionId, params.targetInfo);
-      this.log('info', `Auto-attached ${params.targetInfo.type}: ${params.targetInfo.url}`);
-    } else if (method === 'Target.detachedFromTarget') {
-      attachment.childSessions.delete(params.sessionId);
-      attachment.cdpReadyChildren.delete(params.sessionId);
-    } else if (method === 'Page.javascriptDialogOpening') {
-      // The JS thread is blocked until we respond. Resolve the one-shot
-      // response if armed, else auto-accept so the script doesn't hang.
-      // Fire-and-forget the dismissal — we can't await inside an event
-      // listener, and any handleJavaScriptDialog failure is logged out-of-band.
-      const armed = attachment.nextDialogResponse;
-      attachment.nextDialogResponse = null;
-      const response = armed ?? { accept: true, promptText: '' };
-      const dialogType: string = params?.type ?? 'dialog';
-      const messageQuoted = params?.message ? `"${String(params.message)}"` : '';
-      const choice = response.accept
-        ? response.promptText
-          ? `accept with "${response.promptText}"`
-          : 'accept'
-        : 'cancel';
-      this.log(
-        'info',
-        `Dialog ${dialogType}(${messageQuoted}) → ${choice}${armed ? '' : ' (default)'}`,
-      );
-      this.sendCmd(attachment.target, 'Page.handleJavaScriptDialog', {
-        accept: response.accept,
-        promptText: response.promptText,
-      }).catch((err: any) =>
-        this.log('error', `handleJavaScriptDialog failed: ${err?.message ?? err}`),
-      );
-    } else if (method === 'Target.receivedMessageFromTarget') {
-      let msg: any;
-      try {
-        msg = JSON.parse(params.message);
-      } catch {
-        return;
-      }
-      if (msg.id != null && this.pending.has(msg.id)) {
-        const slot = this.pending.get(msg.id)!;
-        this.pending.delete(msg.id);
-        if (msg.error) slot.reject(new Error(msg.error.message ?? `code ${msg.error.code}`));
-        else slot.resolve(msg.result);
-      }
-    } else if (method === 'Network.requestWillBeSent') {
-      // Method tracking — the responseReceived event doesn't include the
-      // HTTP method, so we record it from requestWillBeSent keyed by
-      // requestId, then look it up when the response arrives. We prune
-      // entries older than 60s during emit to bound memory for long
-      // sessions with many XHRs.
-      const reqId: string | undefined = params?.requestId;
-      const reqMethod: string | undefined = params?.request?.method;
-      if (reqId && reqMethod) {
-        attachment.requestMethodById.set(reqId, {
-          method: String(reqMethod).toUpperCase(),
-          at: Date.now(),
-        });
-        // Opportunistic prune on every insert. Cheap O(map size); rare
-        // path. Cutoff is generous to handle slow servers without losing
-        // the method for the eventual response.
-        const cutoff = Date.now() - 60_000;
-        if (attachment.requestMethodById.size > 200) {
-          for (const [id, entry] of attachment.requestMethodById) {
-            if (entry.at < cutoff) attachment.requestMethodById.delete(id);
-          }
-        }
-      }
-    } else if (method === 'Network.responseReceived') {
-      const reqId: string | undefined = params?.requestId;
-      const response = params?.response;
-      if (!reqId || !response) return;
-      const methodEntry = attachment.requestMethodById.get(reqId);
-      // Consume the method-tracking entry — won't be needed again.
-      attachment.requestMethodById.delete(reqId);
-      attachment.networkWaiter.emit({
-        requestId: reqId,
-        url: String(response.url ?? ''),
-        status: Number(response.status ?? 0),
-        method: methodEntry?.method ?? '',
-      });
-    }
+    this.eventRouter.onEvent(sourceTabId, method, params);
   }
 
   async detach() {
-    if (this.detached) return;
+    if (this.detached) {
+      this.log('info', 'Page.detach() called but already detached.');
+      return;
+    }
     this.detached = true;
-    if (this.listener) chrome.debugger.onEvent.removeListener(this.listener);
-    if (this.tabCreatedListener) {
-      chrome.tabs.onCreated.removeListener(this.tabCreatedListener);
+    this.log('info', 'Page.detach() starting...');
+    // Cleanup network state for all tabs before detaching.
+    for (const tabId of this.tabManager.attachments.keys()) {
+      this.networkMonitor.cleanup(tabId);
     }
-    if (this.tabUpdatedListener) {
-      chrome.tabs.onUpdated.removeListener(this.tabUpdatedListener);
-    }
-    // Cancel any pending awaits so callers don't hang. Per-attachment
-    // network waiters get cleared in their own teardown loop below.
-    this.tabEventWaiter.clear('Page detached');
-
-    // Detach every tab we attached during this run. Order doesn't matter —
-    // each detach is independent. We catch & log per-tab so one bad tab
-    // (e.g., already closed) doesn't prevent the others from cleaning up.
-    // Reject any pending per-tab network waits before we tear down the
-    // sessions — otherwise their callers hang until their own timeouts.
-    for (const att of this.attachments.values()) {
-      att.networkWaiter.clear('Page detached');
-    }
-    const targets = [...this.attachments.values()].map((a) => a.target);
-    this.attachments.clear();
-    for (const target of targets) {
-      try {
-        await this.sendCmd(target, 'Target.setAutoAttach', {
-          autoAttach: false,
-          waitForDebuggerOnStart: false,
-          flatten: false,
-        });
-      } catch {}
-      await new Promise<void>((r) =>
-        chrome.debugger.detach(target, () => {
-          void chrome.runtime.lastError;
-          r();
-        }),
-      );
-    }
-    this.log('info', 'Debugger detached.');
+    await this.tabManager.detachAll();
+    this.cdpPort.detach();
+    this.log('info', 'Page.detach() complete.');
   }
 
   /**
@@ -566,11 +239,7 @@ export class Page {
    * this immediately before the step that will actually trigger one.
    */
   setNextDialogResponse(accept: boolean, promptText: string = ''): void {
-    this.nextDialogResponse = { accept, promptText };
-    this.log(
-      'info',
-      `Next dialog armed → ${accept ? (promptText ? `accept with "${promptText}"` : 'accept') : 'cancel'}`,
-    );
+    this.tabManager.armDialog(accept, promptText);
   }
 
   // ---------- high-level actions ----------
@@ -579,42 +248,107 @@ export class Page {
     url: string,
     opts: { waitForXPath?: string; waitForTimeoutMs?: number } = {},
   ): Promise<void> {
-    // Short-circuit when we're already on the target URL — saves a redundant
-    // reload after the chrome:// pre-flight in background.ts, and lets users
-    // re-run scripts without paying the load cost again.
-    let alreadyThere = false;
+    return this.navigator.goto(url, opts);
+  }
+
+  /**
+   * Central action execution point using ActionDescriptor pattern.
+   * Validates XPath, determines strategy (fast vs CDP), executes with
+   * error context, and returns the result.
+   *
+   * This is the preferred way for action handlers to execute locator-based
+   * actions, replacing direct calls to fill/get/waitFor/etc.
+   */
+  async executeAction<T = any>(descriptor: ActionDescriptor<T>): Promise<ActionResult> {
+    // Click mode must use trusted CDP events (event.isTrusted=true) for
+    // libraries like react-select, MUI Select that gate on this property.
+    // Route to the existing page.click() method which handles this correctly.
+    if (descriptor.mode === 'click') {
+      return this.click(descriptor.locator, {
+        pierceClosed: descriptor.pierceClosed,
+        timeoutMs: descriptor.timeoutMs,
+      });
+    }
+
+    const context = {
+      action: descriptor.name,
+      original: descriptor.originalXPath,
+      resolved: descriptor.locator.xpath,
+      value: (descriptor.opts as any)?.value,
+    };
+
     try {
-      const current = await chrome.tabs.get(this.tabId);
-      alreadyThere = current.url === url && current.status === 'complete';
-    } catch {
-      /* tab gone — fall through to update, which will fail loudly */
-    }
+      // Validate XPath upfront to fail fast on syntax errors
+      await this.domExecutor.validateXPath(this.tabTarget, descriptor.locator.xpath);
 
-    if (alreadyThere) {
-      this.log('info', `Already at ${url}, skipping navigation.`);
-    } else {
-      this.log('info', `Navigating to ${url}…`);
-      await chrome.tabs.update(this.tabId, { url, active: true });
-      await this.waitForLoad(30_000);
-      await sleep(500);
-    }
+      const totalTimeout = descriptor.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+      const deadline = Date.now() + totalTimeout;
 
-    // New page (or possibly different SPA route on the same URL) → new shadow
-    // landscape. Reset and re-detect synchronously so the next action sees
-    // the correct flag. Runs on both paths so re-runs behave the same as
-    // first runs.
-    this.hasClosedShadow = false;
-    await this.detectClosedShadow();
+      // Three-state pierceClosed gate
+      const shouldUseCdp =
+        descriptor.pierceClosed === true ||
+        (descriptor.pierceClosed !== false && this.hasClosedShadow);
 
-    // SPA-aware wait. tabs.onUpdated fires 'complete' on the HTML shell load,
-    // which is too early for React/Vue/Angular pages. If the caller passed a
-    // waitForXPath, block until that element actually exists. Reuses the
-    // standalone waitFor's polling + fast/CDP split + FatalActionError
-    // propagation so behavior is identical to a separate waitFor step.
-    if (opts.waitForXPath) {
-      await this.waitFor(
-        { xpath: opts.waitForXPath },
-        { timeoutMs: opts.waitForTimeoutMs },
+      if (shouldUseCdp) {
+        this.log(
+          'info',
+          descriptor.pierceClosed === true
+            ? 'pierceClosed=true — going straight to CDP DOM walk.'
+            : 'Closed shadow detected — going straight to CDP DOM walk.',
+        );
+        return await this.cdpFindAndActPolling(
+          descriptor.locator,
+          descriptor.mode,
+          descriptor.opts ?? {},
+          totalTimeout,
+        );
+      }
+
+      // Fast path with CDP fallback
+      const expression = buildActionExpression(
+        descriptor.locator,
+        descriptor.mode,
+        descriptor.opts ?? {},
+      );
+      let fastErr: Error | null = null;
+      try {
+        return await this.runUntilFound(expression, totalTimeout);
+      } catch (err) {
+        if (err instanceof FatalActionError) throw err;
+        fastErr = err as Error;
+      }
+
+      // CDP fallback with remaining budget
+      const remainingMs = Math.max(0, deadline - Date.now());
+      this.log(
+        'info',
+        `Fast path missed — trying CDP DOM walk (${remainingMs}ms remaining)…`,
+      );
+      try {
+        return await this.cdpFindAndActPolling(
+          descriptor.locator,
+          descriptor.mode,
+          descriptor.opts ?? {},
+          remainingMs,
+        );
+      } catch (cdpErr: any) {
+        if (cdpErr instanceof FatalActionError) throw cdpErr;
+        this.log('info', `CDP fallback also failed: ${cdpErr?.message ?? cdpErr}`);
+        throw fastErr;
+      }
+    } catch (err: any) {
+      // Add error context (same as withLocatorContext)
+      if (err instanceof FatalActionError) throw err;
+
+      const target = context.original ?? '(no xpath)';
+      const valuePart = context.value !== undefined ? ` → ${JSON.stringify(String(context.value))}` : '';
+      const tail = context.original && context.original !== context.resolved
+        ? `\n  resolved xpath: ${context.resolved}`
+        : '';
+      const baseMessage = err?.message ?? String(err);
+
+      throw new Error(
+        `Failed to ${context.action} ${target}${valuePart}: ${baseMessage}${tail}`,
       );
     }
   }
@@ -631,54 +365,15 @@ export class Page {
    * for React/Vue/Angular. Pass an xpath that's guaranteed to render after
    * mount to delay until the framework is up.
    */
+  // ---------- multi-tab orchestration (delegated to TabManager) ----------
+
   async openTab(
     url: string,
     opts: { waitForXPath?: string; waitForTimeoutMs?: number } = {},
   ): Promise<number> {
-    // Open in the CURRENT tab's window, not the engine's original `windowId`.
-    // This matters once Batch 1.5's `openWindow` is in play — when the engine
-    // is driving a tab inside a popup window, a subsequent `tab open` should
-    // land in that popup window, not bounce back to the primary. Fall back to
-    // the original windowId if the lookup fails (e.g., tab was closed).
-    const currentTab = await chrome.tabs.get(this.currentTabId).catch(() => null);
-    const targetWindowId = currentTab?.windowId ?? this.windowId;
-    const created = await chrome.tabs.create({
-      url,
-      active: true,
-      windowId: targetWindowId,
-    });
-    if (created.id === undefined) {
-      throw new Error('tab open: chrome.tabs.create returned no tab id.');
-    }
-    // Push BEFORE switching so `closeTab` works even if attach fails mid-way.
-    this.originStack.push(this.currentTabId);
-    await waitForTabComplete(created.id, 30_000);
-    await this.attachTab(created.id);
-    this.log('info', `Opened new tab ${created.id} → ${url}`);
-    if (opts.waitForXPath) {
-      await this.waitFor(
-        { xpath: opts.waitForXPath },
-        { timeoutMs: opts.waitForTimeoutMs },
-      );
-    }
-    return created.id;
+    return this.tabManager.openTab(url, opts, this.waitFor.bind(this));
   }
 
-  /**
-   * Open a new BROWSER WINDOW at `url` and attach the engine to its (single)
-   * tab. Use `windowType: 'popup'` + size fields for a sized lookup window;
-   * default is a regular Chrome window with full chrome.
-   *
-   * Same return-to-origin semantics as `openTab`: pushes the previously-
-   * current tabId onto the origin stack, so a subsequent `closeTab` pops back
-   * to the original tab (in the original window). Closing the only tab in a
-   * popup window auto-closes the window via Chrome's default behavior — no
-   * separate `closeWindow` op is needed.
-   *
-   * `chrome.windows.create` is an extension API, not a page-side call, so it
-   * is NOT subject to the page's popup blocker. Works for any URL — including
-   * `file://` — that the extension itself is allowed to navigate to.
-   */
   async openWindow(
     url: string,
     opts: {
@@ -691,182 +386,28 @@ export class Page {
       waitForTimeoutMs?: number;
     } = {},
   ): Promise<number> {
-    const createInfo: chrome.windows.CreateData = {
-      url,
-      focused: true,
-      type: opts.windowType ?? 'normal',
-    };
-    if (opts.width !== undefined) createInfo.width = opts.width;
-    if (opts.height !== undefined) createInfo.height = opts.height;
-    if (opts.left !== undefined) createInfo.left = opts.left;
-    if (opts.top !== undefined) createInfo.top = opts.top;
-
-    const win = await chrome.windows.create(createInfo);
-    const newTab = win?.tabs?.[0];
-    if (!newTab?.id) {
-      throw new Error(
-        'tab openWindow: chrome.windows.create returned no tab — window creation failed.',
-      );
-    }
-    // Push BEFORE attach so close-on-failure leaves the engine pointing at a
-    // valid tab. (Same invariant as openTab.)
-    this.originStack.push(this.currentTabId);
-    await waitForTabComplete(newTab.id, 30_000);
-    await this.attachTab(newTab.id);
-    this.log(
-      'info',
-      `Opened new ${createInfo.type} window ${win.id} → ${url} (tab ${newTab.id}).`,
-    );
-    if (opts.waitForXPath) {
-      await this.waitFor(
-        { xpath: opts.waitForXPath },
-        { timeoutMs: opts.waitForTimeoutMs },
-      );
-    }
-    return newTab.id;
+    return this.tabManager.openWindow(url, opts, this.waitFor.bind(this));
   }
 
-  /**
-   * Switch the active tab to one matching either `urlMatches` or `index`
-   * within the window. Already-attached tabs cost only a pointer flip; new
-   * tabs pay the ~1s attach overhead the first time.
-   *
-   * Pushes onto the origin stack so the caller can `closeTab` back to where
-   * they came from. Pass `{noStack:true}` for direct switches that shouldn't
-   * be "undone" by a later close (currently unused — exposed for future
-   * ergonomics).
-   */
   async switchToTab(
     spec: { urlMatches?: string; index?: number },
     opts: { noStack?: boolean } = {},
   ): Promise<number> {
-    const tabs = await chrome.tabs.query(
-      this.windowId !== undefined ? { windowId: this.windowId } : {},
-    );
-    let target: chrome.tabs.Tab | undefined;
-    if (typeof spec.index === 'number') {
-      // tabs.query order matches the tab strip. `index` field on the Tab
-      // confirms the position so we don't get bitten by query order quirks.
-      target = tabs.find((t) => t.index === spec.index);
-    } else if (spec.urlMatches) {
-      const matcher = parseUrlMatcher(spec.urlMatches);
-      target = tabs.find((t) => matcher(t.url ?? t.pendingUrl ?? ''));
-    }
-    if (!target?.id) {
-      throw new Error(
-        `tab switchTo: no tab matched ${
-          spec.urlMatches ? `'${spec.urlMatches}'` : `index ${spec.index}`
-        }`,
-      );
-    }
-    if (target.id === this.currentTabId) {
-      this.log('info', `tab switchTo: already on tab ${target.id}.`);
-      return target.id;
-    }
-    if (!opts.noStack) this.originStack.push(this.currentTabId);
-    await chrome.tabs.update(target.id, { active: true });
-    await this.attachTab(target.id);
-    this.log('info', `Switched to tab ${target.id} (${target.url ?? ''}).`);
-    return target.id;
+    return this.tabManager.switchToTab(spec, opts);
   }
 
-  /**
-   * Wait for a new tab to open in this window (triggered by something the
-   * previous step did, e.g., clicking a `target="_blank"` link), then attach
-   * and activate it. The onCreated → onUpdated dance lives in
-   * `waitForNewTabMatching` over in tabAccess.ts.
-   */
   async waitForNewTab(
     opts: { urlMatches?: string; timeoutMs?: number } = {},
   ): Promise<number> {
-    const timeoutMs = opts.timeoutMs ?? 10_000;
-    const matcher = parseUrlMatcher(opts.urlMatches);
-
-    // Predicate: tab not already attached, not the current tab, and URL
-    // (or pendingUrl) matches. The waiter's ringbuffer scans recent events
-    // first, so a tab opened synchronously inside the prior step still
-    // resolves the await — no separate race-tolerant pre-check needed.
-    const predicate = (tab: chrome.tabs.Tab): boolean => {
-      if (tab.id === undefined) return false;
-      if (tab.id === this.currentTabId) return false;
-      if (this.attachments.has(tab.id)) return false;
-      const url = tab.url ?? tab.pendingUrl ?? '';
-      if (!url) return false;
-      return matcher(url);
-    };
-
-    const matched = await this.tabEventWaiter.await(
-      predicate,
-      timeoutMs,
-      `new tab${opts.urlMatches ? ` matching '${opts.urlMatches}'` : ''}`,
-    );
-    if (matched.id === undefined) {
-      throw new Error('waitForNewTab: matched tab has no id (unexpected).');
-    }
-    const id = matched.id;
-
-    this.originStack.push(this.currentTabId);
-    await chrome.tabs.update(id, { active: true }).catch(() => {});
-    await waitForTabComplete(id, 30_000);
-    await this.attachTab(id);
-    this.log('info', `New tab ${id} ready; engine attached.`);
-    return id;
+    return this.tabManager.waitForNewTab(opts);
   }
 
-  /**
-   * Close the current tab, detach its debugger session, and pop the origin
-   * stack to focus the previous tab. With an empty stack we just close and
-   * let Chrome decide focus.
-   */
   async closeTab(): Promise<void> {
-    const closingId = this.currentTabId;
-    if (this.attachments.size === 1 && this.originStack.length === 0) {
-      throw new Error(
-        'tab close: refusing to close the only attached tab — that would orphan the run. Did you forget to open or switch first?',
-      );
-    }
-    const target = this.attachment.target;
-    // Detach BEFORE removing the tab. Otherwise Chrome closes the tab, fires
-    // the auto-detach event, and chrome.debugger.detach errors with "No tab
-    // with given id" — which we'd have to swallow.
-    try {
-      await this.sendCmd(target, 'Target.setAutoAttach', {
-        autoAttach: false,
-        waitForDebuggerOnStart: false,
-        flatten: false,
-      });
-    } catch {}
-    await new Promise<void>((r) =>
-      chrome.debugger.detach(target, () => {
-        void chrome.runtime.lastError;
-        r();
-      }),
-    );
-    this.attachments.delete(closingId);
+    await this.tabManager.closeTab();
+  }
 
-    try {
-      await chrome.tabs.remove(closingId);
-    } catch (err: any) {
-      // Tab might have already been closed by something else — that's fine.
-      this.log('info', `tab close: chrome.tabs.remove non-fatal: ${err?.message ?? err}`);
-    }
-
-    const previous = this.originStack.pop();
-    if (previous !== undefined && this.attachments.has(previous)) {
-      this.currentTabId = previous;
-      await chrome.tabs.update(previous, { active: true }).catch(() => {});
-      this.log('info', `Closed tab ${closingId}; back on tab ${previous}.`);
-    } else {
-      // Origin stack empty or the previous tab was closed by the page. Fall
-      // back to any remaining attached tab.
-      const fallback = this.attachments.keys().next().value;
-      if (fallback === undefined) {
-        throw new Error('tab close: no remaining attached tabs.');
-      }
-      this.currentTabId = fallback;
-      await chrome.tabs.update(fallback, { active: true }).catch(() => {});
-      this.log('info', `Closed tab ${closingId}; fell back to tab ${fallback}.`);
-    }
+  async cycleTab(direction: 'next' | 'previous'): Promise<number> {
+    return this.tabManager.cycleTab(direction);
   }
 
   // ---------- network waits (Batch 3) ----------
@@ -890,85 +431,12 @@ export class Page {
     timeoutMs?: number;
     saveBody?: boolean;
   }): Promise<NetworkResponse & { body?: string }> {
-    const timeoutMs = opts.timeoutMs ?? 30_000;
-    const urlPred = parseUrlMatcher(opts.urlMatches);
-    const statusPred = buildStatusPredicate(opts.status);
-    const methodPred = opts.method
-      ? (m: string) => m === String(opts.method).toUpperCase()
-      : () => true;
-
-    const predicate = (r: NetworkResponse): boolean =>
-      urlPred(r.url) && statusPred(r.status) && methodPred(r.method);
-
-    const matched = await this.attachment.networkWaiter.await(
-      predicate,
-      timeoutMs,
-      describeResponseFilter(opts),
+    const result = await this.networkMonitor.waitForResponse(
+      this.tabId,
+      this.tabTarget,
+      opts,
     );
-
-    let body: string | undefined;
-    if (opts.saveBody) {
-      body = await this.fetchResponseBody(matched.requestId);
-    }
-    return { ...matched, body };
-  }
-
-  /**
-   * Read the body of a previously-received response via
-   * `Network.getResponseBody`. Decodes base64 transparently so callers
-   * always get a string. Returns empty string if the body is unavailable
-   * (Chrome discards bodies for some redirect chains and image fetches).
-   */
-  private async fetchResponseBody(requestId: string): Promise<string> {
-    try {
-      const res = await this.sendCmd<any>(this.tabTarget, 'Network.getResponseBody', {
-        requestId,
-      });
-      const body = String(res?.body ?? '');
-      if (res?.base64Encoded) {
-        try {
-          // atob is available in service workers and browser contexts.
-          return atob(body);
-        } catch {
-          return body; // give up gracefully — return raw base64
-        }
-      }
-      return body;
-    } catch (err: any) {
-      this.log(
-        'info',
-        `getResponseBody for ${requestId} failed: ${err?.message ?? err}. Returning empty string.`,
-      );
-      return '';
-    }
-  }
-
-  /**
-   * Cycle to the next/previous tab in the window's tab strip relative to the
-   * current one. Wraps at the ends. Pushes the origin so `close` can pop back.
-   */
-  async cycleTab(direction: 'next' | 'previous'): Promise<number> {
-    const tabs = await chrome.tabs.query(
-      this.windowId !== undefined ? { windowId: this.windowId } : {},
-    );
-    if (tabs.length === 0) {
-      throw new Error(`tab ${direction}: no tabs found in window.`);
-    }
-    tabs.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-    const i = tabs.findIndex((t) => t.id === this.currentTabId);
-    const step = direction === 'next' ? 1 : -1;
-    const target = tabs[(i + step + tabs.length) % tabs.length];
-    if (!target?.id || target.id === this.currentTabId) {
-      throw new Error(`tab ${direction}: nowhere to cycle to.`);
-    }
-    this.originStack.push(this.currentTabId);
-    await chrome.tabs.update(target.id, { active: true });
-    await this.attachTab(target.id);
-    this.log(
-      'info',
-      `Cycled ${direction} → tab ${target.id} (${target.url ?? ''}).`,
-    );
-    return target.id;
+    return result;
   }
 
   async fill(
@@ -991,7 +459,7 @@ export class Page {
     locator: Locator,
     opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<FrameResult> {
-    await this.validateXPath(locator.xpath);
+    await this.domExecutor.validateXPath(this.tabTarget,locator.xpath);
     const timeout = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
 
     // Three-state pierceClosed: explicit true/false overrides; undefined
@@ -1044,10 +512,11 @@ export class Page {
     }
 
     if (resolved?.isMain === true && typeof resolved.x === 'number') {
-      await this.dispatchTrustedClick(resolved.x, resolved.y);
+      await this.inputExecutor.dispatchTrustedClick(this.tabTarget, resolved.x, resolved.y);
+      const dbg = resolved._debug ? ` [class="${(resolved._debug as any).class || ''}" text="${(resolved._debug as any).text || ''}"]` : '';
       this.log(
         'success',
-        `Clicked ${resolved.tag ?? 'element'} (trusted) at (${Math.round(
+        `Clicked ${resolved.tag ?? 'element'}${dbg} (trusted) at (${Math.round(
           resolved.x,
         )}, ${Math.round(resolved.y)}) in ${resolved.frame}`,
       );
@@ -1075,104 +544,11 @@ export class Page {
   /** Resolve the element via CDP, scroll it into view, then trusted-click. */
   private async cdpTrustedClick(locator: Locator): Promise<FrameResult> {
     const send = (m: string, p?: Record<string, unknown>) =>
-      this.sendCmd(this.tabTarget, m, p);
-    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
-    if (!nodeId) {
-      throw new Error(`No match found for '${locator.xpath}' via CDP DOM walk.`);
-    }
-
-    // Scroll into view + overlay hit-test in a single callFunctionOn to avoid a
-    // second round-trip. The in-page function returns either {ok:true} or, if
-    // some other element would absorb a click at the target center,
-    // {ok:false, fatal:true, reason:'covered', message:...} — we surface that
-    // as a FatalActionError so page.click()'s caller sees a clear reason
-    // instead of a vague CDP failure.
-    const resolved = await send('DOM.resolveNode', { nodeId });
-    const objectId = resolved?.object?.objectId;
-    if (objectId) {
-      try {
-        const checkRes = await send('Runtime.callFunctionOn', {
-          objectId,
-          functionDeclaration: `function () {
-            this.scrollIntoView({ block: 'center', inline: 'center' });
-            const r = this.getBoundingClientRect();
-            const cx = r.left + r.width / 2;
-            const cy = r.top + r.height / 2;
-            try {
-              const root = this.getRootNode();
-              const efp = (root && typeof root.elementsFromPoint === 'function'
-                ? root.elementsFromPoint(cx, cy)
-                : document.elementsFromPoint(cx, cy));
-              const top = efp && efp[0];
-              if (top && !this.contains(top)) {
-                const tag = this.tagName ? this.tagName.toLowerCase() : 'element';
-                const ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
-                const topTag = top.tagName ? top.tagName.toLowerCase() : 'element';
-                return {
-                  ok: false,
-                  fatal: true,
-                  reason: 'covered',
-                  message: 'Cannot click ' + tag + ident + ': covered by <' + topTag + '>',
-                  frame: location.href,
-                  tag: this.tagName,
-                  name: this.name || this.id || '',
-                };
-              }
-            } catch (e) {}
-            return { ok: true };
-          }`,
-          returnByValue: true,
-        });
-        const out = checkRes?.result?.value as FrameResult | undefined;
-        if (out?.fatal) {
-          throw new FatalActionError(
-            out.message ?? `Click target is ${out.reason ?? 'rejected'}`,
-            coerceFatalReason(out.reason),
-          );
-        }
-      } finally {
-        await send('Runtime.releaseObject', { objectId }).catch(() => {});
-      }
-    }
-
-    const box = await send('DOM.getBoxModel', { nodeId });
-    const content = box?.model?.content as number[] | undefined;
-    if (!content || content.length < 8) {
-      throw new Error('Element has no box model (zero-size or detached).');
-    }
-    const x = (content[0] + content[4]) / 2;
-    const y = (content[1] + content[5]) / 2;
-    await this.dispatchTrustedClick(x, y);
-    this.log(
-      'success',
-      `Clicked (trusted, CDP-resolved) at (${Math.round(x)}, ${Math.round(y)}).`,
-    );
+      this.cdpPort.sendCommand(this.tabTarget, m, p);
+    const { x, y } = await this.domExecutor.cdpResolveAndVerify(send, locator.xpath, 'click');
+    await this.inputExecutor.dispatchTrustedClick(this.tabTarget, x, y);
+    this.log('success', `Clicked (trusted, CDP-resolved) at (${Math.round(x)}, ${Math.round(y)}).`);
     return { ok: true, frame: '' };
-  }
-
-  /** Send a trusted left-click at (x, y) in the tab's viewport coordinates. */
-  private async dispatchTrustedClick(x: number, y: number): Promise<void> {
-    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
-      type: 'mouseMoved',
-      x,
-      y,
-    });
-    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed',
-      x,
-      y,
-      button: 'left',
-      buttons: 1,
-      clickCount: 1,
-    });
-    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased',
-      x,
-      y,
-      button: 'left',
-      buttons: 1,
-      clickCount: 1,
-    });
   }
 
   /**
@@ -1187,7 +563,7 @@ export class Page {
     locator: Locator,
     opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<FrameResult> {
-    await this.validateXPath(locator.xpath);
+    await this.domExecutor.validateXPath(this.tabTarget,locator.xpath);
     const timeout = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
 
     // Three-state pierceClosed: same gate as click. Closed-shadow auto-detect
@@ -1225,7 +601,7 @@ export class Page {
     }
 
     if (resolved?.isMain === true && typeof resolved.x === 'number') {
-      await this.dispatchTrustedMouseMove(resolved.x, resolved.y);
+      await this.inputExecutor.dispatchTrustedMouseMove(this.tabTarget, resolved.x, resolved.y);
       this.log(
         'success',
         `Hovered ${resolved.tag ?? 'element'} (trusted) at (${Math.round(
@@ -1263,85 +639,11 @@ export class Page {
    */
   private async cdpTrustedHover(locator: Locator): Promise<FrameResult> {
     const send = (m: string, p?: Record<string, unknown>) =>
-      this.sendCmd(this.tabTarget, m, p);
-    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
-    if (!nodeId) {
-      throw new Error(`No match found for '${locator.xpath}' via CDP DOM walk.`);
-    }
-
-    // scrollIntoView + overlay hit-test in a single callFunctionOn (same
-    // pattern as cdpTrustedClick).
-    const resolved = await send('DOM.resolveNode', { nodeId });
-    const objectId = resolved?.object?.objectId;
-    if (objectId) {
-      try {
-        const checkRes = await send('Runtime.callFunctionOn', {
-          objectId,
-          functionDeclaration: `function () {
-            this.scrollIntoView({ block: 'center', inline: 'center' });
-            const r = this.getBoundingClientRect();
-            const cx = r.left + r.width / 2;
-            const cy = r.top + r.height / 2;
-            try {
-              const root = this.getRootNode();
-              const efp = (root && typeof root.elementsFromPoint === 'function'
-                ? root.elementsFromPoint(cx, cy)
-                : document.elementsFromPoint(cx, cy));
-              const top = efp && efp[0];
-              if (top && !this.contains(top)) {
-                const tag = this.tagName ? this.tagName.toLowerCase() : 'element';
-                const ident = this.name ? '[name="' + this.name + '"]' : (this.id ? '#' + this.id : '');
-                const topTag = top.tagName ? top.tagName.toLowerCase() : 'element';
-                return {
-                  ok: false,
-                  fatal: true,
-                  reason: 'covered',
-                  message: 'Cannot hover ' + tag + ident + ': covered by <' + topTag + '>',
-                  frame: location.href,
-                  tag: this.tagName,
-                  name: this.name || this.id || '',
-                };
-              }
-            } catch (e) {}
-            return { ok: true };
-          }`,
-          returnByValue: true,
-        });
-        const out = checkRes?.result?.value as FrameResult | undefined;
-        if (out?.fatal) {
-          throw new FatalActionError(
-            out.message ?? `Hover target is ${out.reason ?? 'rejected'}`,
-            coerceFatalReason(out.reason),
-          );
-        }
-      } finally {
-        await send('Runtime.releaseObject', { objectId }).catch(() => {});
-      }
-    }
-
-    const box = await send('DOM.getBoxModel', { nodeId });
-    const content = box?.model?.content as number[] | undefined;
-    if (!content || content.length < 8) {
-      throw new Error('Element has no box model (zero-size or detached).');
-    }
-    const x = (content[0] + content[4]) / 2;
-    const y = (content[1] + content[5]) / 2;
-    await this.dispatchTrustedMouseMove(x, y);
-    this.log(
-      'success',
-      `Hovered (trusted, CDP-resolved) at (${Math.round(x)}, ${Math.round(y)}).`,
-    );
+      this.cdpPort.sendCommand(this.tabTarget, m, p);
+    const { x, y } = await this.domExecutor.cdpResolveAndVerify(send, locator.xpath, 'hover');
+    await this.inputExecutor.dispatchTrustedMouseMove(this.tabTarget, x, y);
+    this.log('success', `Hovered (trusted, CDP-resolved) at (${Math.round(x)}, ${Math.round(y)}).`);
     return { ok: true, frame: '' };
-  }
-
-  /** Trusted cursor-move via CDP. Triggers CSS `:hover` natively, plus all
-   *  the pointer/mouse hover events Chrome would normally dispatch. */
-  private async dispatchTrustedMouseMove(x: number, y: number): Promise<void> {
-    await this.sendCmd(this.tabTarget, 'Input.dispatchMouseEvent', {
-      type: 'mouseMoved',
-      x,
-      y,
-    });
   }
 
   /**
@@ -1358,7 +660,7 @@ export class Page {
     locator: Locator,
     opts: { pierceClosed?: boolean } = {},
   ): Promise<DescribeResult> {
-    await this.validateXPath(locator.xpath);
+    await this.domExecutor.validateXPath(this.tabTarget,locator.xpath);
 
     const shouldUseCdp =
       opts.pierceClosed === true ||
@@ -1374,7 +676,7 @@ export class Page {
       return await this.describeCdp(locator);
     }
 
-    const res = await this.sendCmd<any>(this.tabTarget, 'Runtime.evaluate', {
+    const res = await this.cdpPort.sendCommand<any>(this.tabTarget, 'Runtime.evaluate', {
       expression: buildDescribeExpression(locator),
       returnByValue: true,
       awaitPromise: false,
@@ -1394,46 +696,20 @@ export class Page {
    *  `cdpResolveXPath` to enumerate all matches wasn't justified for v1. */
   private async describeCdp(locator: Locator): Promise<DescribeResult> {
     const send = (m: string, p?: Record<string, unknown>) =>
-      this.sendCmd(this.tabTarget, m, p);
-    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
-    if (!nodeId) return { matchCount: 0, matches: [] };
-
-    const resolved = await send('DOM.resolveNode', { nodeId });
-    const objectId = resolved?.object?.objectId;
-    if (!objectId) return { matchCount: 0, matches: [] };
-
-    try {
-      const res = await send('Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: `function () {
-          var classes = [];
-          if (this.className) {
-            var s = typeof this.className === 'string'
-              ? this.className
-              : (this.className.baseVal || '');
-            classes = s.split(/\\s+/).filter(Boolean);
-          }
-          var text = '';
-          try { text = (this.innerText || this.textContent || '').trim(); } catch (e) {}
-          if (text.length > 60) text = text.slice(0, 60) + '…';
-          var out = {
-            frame: location.href,
-            tag: this.tagName || '',
-            classes: classes,
-            text: text,
-          };
-          if (this.id) out.id = this.id;
-          if (this.name) out.name = this.name;
-          return out;
-        }`,
-        returnByValue: true,
-      });
-      const match = res?.result?.value as DescribeMatch | undefined;
-      if (!match) return { matchCount: 0, matches: [] };
-      return { matchCount: 1, matches: [match] };
-    } finally {
-      await send('Runtime.releaseObject', { objectId }).catch(() => {});
-    }
+      this.cdpPort.sendCommand(this.tabTarget, m, p);
+    const match = await this.domExecutor.cdpDescribe(send, locator.xpath);
+    if (!match) return { matchCount: 0, matches: [] };
+    return {
+      matchCount: 1,
+      matches: [{
+        frame: '',
+        tag: match.tag ?? '',
+        id: match.id,
+        name: match.name,
+        classes: match.classes,
+        text: match.text,
+      }],
+    };
   }
 
   async waitFor(
@@ -1462,42 +738,20 @@ export class Page {
     key: string,
     opts: { pierceClosed?: boolean } = {},
   ): Promise<void> {
-    if (locator) {
-      await this.validateXPath(locator.xpath);
-      const send = (m: string, p?: Record<string, unknown>) =>
-        this.sendCmd(this.tabTarget, m, p);
-      const nodeId = await this.cdpResolveXPath(send, locator.xpath);
-      if (!nodeId) {
-        throw new Error(`Press: no match for '${locator.xpath}' via CDP DOM walk.`);
-      }
-      const resolved = await send('DOM.resolveNode', { nodeId });
-      const objectId = resolved?.object?.objectId;
-      if (objectId) {
-        try {
-          await send('Runtime.callFunctionOn', {
-            objectId,
-            functionDeclaration:
-              'function () { if (typeof this.focus === "function") this.focus(); }',
-          });
-        } finally {
-          await send('Runtime.releaseObject', { objectId }).catch(() => {});
+    // Helper to focus an element via CDP before pressing a key.
+    const focusElement = locator
+      ? async (send: (m: string, p?: Record<string, unknown>) => Promise<any>, xpath: string) => {
+          await this.domExecutor.cdpFocusElement(send, xpath);
         }
-      }
-      // pierceClosed is accepted for parity with other actions but isn't
-      // structurally needed here — cdpResolveXPath already pierces.
-      void opts.pierceClosed;
-    }
+      : undefined;
 
-    const params = mapKeyToCdp(key);
-    await this.sendCmd(this.tabTarget, 'Input.dispatchKeyEvent', {
-      type: 'keyDown',
-      ...params,
+    await this.inputExecutor.press(this.tabTarget, key, {
+      locator: locator ?? undefined,
+      focusElement,
     });
-    await this.sendCmd(this.tabTarget, 'Input.dispatchKeyEvent', {
-      type: 'keyUp',
-      ...params,
-    });
-    this.log('success', `Pressed "${key}".`);
+    // pierceClosed is accepted for parity with other actions but isn't
+    // structurally needed here — cdpResolveXPath already pierces.
+    void opts.pierceClosed;
   }
 
   /**
@@ -1528,7 +782,7 @@ export class Page {
     if (opts.timeoutMs && opts.timeoutMs > 0) {
       params.timeout = opts.timeoutMs;
     }
-    const res = await this.sendCmd<any>(this.tabTarget, 'Runtime.evaluate', params);
+    const res = await this.cdpPort.sendCommand<any>(this.tabTarget, 'Runtime.evaluate', params);
     if (res?.exceptionDetails) {
       const desc =
         res.exceptionDetails.exception?.description ??
@@ -1555,74 +809,14 @@ export class Page {
     files: string[],
     opts: { pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<void> {
-    await this.validateXPath(locator.xpath);
+    await this.domExecutor.validateXPath(this.tabTarget,locator.xpath);
     // pierceClosed accepted for parity; cdpResolveXPath always pierces.
     void opts.pierceClosed;
 
-    for (const f of files) {
-      if (!isAbsoluteFilePath(f)) {
-        throw new Error(
-          `upload: file path must be absolute — got '${f}'. ` +
-            'Chrome resolves relative paths against an unpredictable cwd, so we require an absolute path on the local filesystem.',
-        );
-      }
-    }
-
-    const send = (m: string, p?: Record<string, unknown>) =>
-      this.sendCmd(this.tabTarget, m, p);
-
-    // Poll for the input to appear. Mirrors the cdpFindAndActPolling cadence
-    // (500ms) but skips the FrameResult plumbing — upload doesn't run an
-    // in-page action function, just resolves a nodeId and feeds it to
-    // setFileInputFiles directly.
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
-    const deadline = Date.now() + timeoutMs;
-    let nodeId: number | null = null;
-    while (true) {
-      nodeId = await this.cdpResolveXPath(send, locator.xpath);
-      if (nodeId) break;
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `upload: locator not found within ${Math.round(timeoutMs / 1000)}s — '${locator.xpath}'`,
-        );
-      }
-      await sleep(500);
-    }
-
-    // Verify it's actually a file input. setFileInputFiles silently fails on
-    // a wrong target (Chrome accepts the call but no files attach); we'd
-    // rather surface the mistake here than have the user wonder why the
-    // upload "succeeded" but nothing happened.
-    const resolved = await send('DOM.resolveNode', { nodeId });
-    const objectId = resolved?.object?.objectId;
-    if (objectId) {
-      try {
-        const check = await send('Runtime.callFunctionOn', {
-          objectId,
-          functionDeclaration:
-            'function () { return { tag: this.tagName, type: (this.type || "").toLowerCase() }; }',
-          returnByValue: true,
-        });
-        const meta = check?.result?.value as { tag?: string; type?: string } | undefined;
-        if (meta?.tag !== 'INPUT' || meta?.type !== 'file') {
-          const got = meta?.tag
-            ? `<${meta.tag.toLowerCase()}${meta.type ? ` type="${meta.type}"` : ''}>`
-            : 'unknown';
-          throw new Error(
-            `upload: target is not an <input type="file"> (got ${got}). ` +
-              "Many sites hide the real input behind a styled wrapper button — point the xpath at the input itself, not the wrapper.",
-          );
-        }
-      } finally {
-        await send('Runtime.releaseObject', { objectId }).catch(() => {});
-      }
-    }
-
-    await send('DOM.setFileInputFiles', { nodeId, files });
-    this.log(
-      'success',
-      `Uploaded ${files.length} file${files.length === 1 ? '' : 's'} into '${locator.xpath}'.`,
-    );
+    return this.uploadHandler.upload(this.tabTarget, locator, files, {
+      timeoutMs: opts.timeoutMs,
+      resolveXPath: (sendFn, xpath) => this.domExecutor.cdpResolveXPath(sendFn, xpath),
+    });
   }
 
   /**
@@ -1642,126 +836,14 @@ export class Page {
     wants: string[],
     opts: { useLabel?: boolean; pierceClosed?: boolean; timeoutMs?: number } = {},
   ): Promise<number> {
-    await this.validateXPath(locator.xpath);
+    await this.domExecutor.validateXPath(this.tabTarget,locator.xpath);
     void opts.pierceClosed;
 
-    const send = (m: string, p?: Record<string, unknown>) =>
-      this.sendCmd(this.tabTarget, m, p);
-
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
-    const deadline = Date.now() + timeoutMs;
-    let nodeId: number | null = null;
-    while (true) {
-      nodeId = await this.cdpResolveXPath(send, locator.xpath);
-      if (nodeId) break;
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `selectOption: locator not found within ${Math.round(timeoutMs / 1000)}s — '${locator.xpath}'`,
-        );
-      }
-      await sleep(500);
-    }
-
-    const resolved = await send('DOM.resolveNode', { nodeId });
-    const objectId = resolved?.object?.objectId;
-    if (!objectId) {
-      throw new Error('selectOption: could not resolve element to an object.');
-    }
-
-    // In-page iterator. Returns either {ok:true, selected:n} or a fatal
-    // sentinel — we surface fatal as FatalActionError so the run loop
-    // stops politely instead of doing CDP retries.
-    const fnDecl = `function (wants, useLabel) {
-      if (this.tagName !== 'SELECT') {
-        return {
-          ok: false,
-          fatal: true,
-          reason: 'not-a-select',
-          message: 'selectOption: target is not <select> (got <' + (this.tagName ? this.tagName.toLowerCase() : '?') + '>).',
-        };
-      }
-      if (this.disabled) {
-        return {
-          ok: false,
-          fatal: true,
-          reason: 'disabled',
-          message: 'selectOption: <select> is disabled.',
-        };
-      }
-      var wantSet = {};
-      for (var w = 0; w < wants.length; w++) wantSet[String(wants[w])] = true;
-      var multi = this.multiple === true;
-      var selected = 0;
-      var firstMatchIdx = -1;
-      for (var i = 0; i < this.options.length; i++) {
-        var opt = this.options[i];
-        var key = useLabel ? (opt.label || '').trim() : String(opt.value);
-        var match = Object.prototype.hasOwnProperty.call(wantSet, key);
-        if (multi) {
-          opt.selected = match;
-          if (match) selected++;
-        } else if (match && firstMatchIdx === -1) {
-          firstMatchIdx = i;
-        }
-      }
-      if (!multi) {
-        if (firstMatchIdx === -1) {
-          return {
-            ok: false,
-            fatal: true,
-            reason: 'no-match',
-            message: 'selectOption: no option matched ' + JSON.stringify(wants) + (useLabel ? ' (by label)' : ' (by value)') + '.',
-          };
-        }
-        this.selectedIndex = firstMatchIdx;
-        selected = 1;
-      } else if (selected === 0) {
-        return {
-          ok: false,
-          fatal: true,
-          reason: 'no-match',
-          message: 'selectOption: no option matched ' + JSON.stringify(wants) + (useLabel ? ' (by label)' : ' (by value)') + '.',
-        };
-      }
-      this.dispatchEvent(new Event('input', { bubbles: true }));
-      this.dispatchEvent(new Event('change', { bubbles: true }));
-      return { ok: true, selected: selected };
-    }`;
-
-    let count = 0;
-    try {
-      const res = await send('Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: fnDecl,
-        arguments: [{ value: wants }, { value: opts.useLabel === true }],
-        returnByValue: true,
-      });
-      if (res?.exceptionDetails) {
-        throw new Error(
-          res.exceptionDetails.exception?.description ??
-            res.exceptionDetails.text ??
-            'selectOption: callFunctionOn failed',
-        );
-      }
-      const result = res?.result?.value as
-        | { ok: boolean; fatal?: boolean; reason?: string; message?: string; selected?: number }
-        | undefined;
-      if (result?.fatal) {
-        throw new FatalActionError(
-          result.message ?? 'selectOption rejected',
-          coerceFatalReason(result.reason),
-        );
-      }
-      count = result?.selected ?? 0;
-    } finally {
-      await send('Runtime.releaseObject', { objectId }).catch(() => {});
-    }
-
-    this.log(
-      'success',
-      `Selected ${count} option${count === 1 ? '' : 's'} in '${locator.xpath}'.`,
-    );
-    return count;
+    return this.selectHandler.selectOption(this.tabTarget, locator, wants, {
+      useLabel: opts.useLabel,
+      timeoutMs: opts.timeoutMs,
+      resolveXPath: (sendFn, xpath) => this.domExecutor.cdpResolveXPath(sendFn, xpath),
+    });
   }
 
   private async runAction(
@@ -1772,7 +854,7 @@ export class Page {
     pierceClosed?: boolean,
   ): Promise<FrameResult> {
     // Surface XPath syntax errors loudly before the 20-second search timeout.
-    await this.validateXPath(locator.xpath);
+    await this.domExecutor.validateXPath(this.tabTarget,locator.xpath);
 
     // Single shared deadline across fast path + CDP fallback. Previously each
     // phase got its own `timeoutMs`, so `timeoutMs: 2000` effectively allowed
@@ -1871,71 +953,12 @@ export class Page {
     expression: string,
     timeoutMs: number,
   ): Promise<FrameResult> {
-    const start = Date.now();
-    const runtimeEnabled = new Set<string>();
-    let maxInputs = 0;
-
-    while (Date.now() - start < timeoutMs) {
-      const main = await this.evalSafe(this.tabTarget, expression);
-      if (main?.ok) return main;
-      // Found-but-rejected (disabled input, etc.). Bail out of the poll loop
-      // immediately — no amount of waiting will change the verdict.
-      if (main?.fatal) {
-        throw new FatalActionError(
-          main.message ?? `Action rejected: ${main.reason ?? 'unknown'}`,
-          coerceFatalReason(main.reason),
-        );
-      }
-      if (typeof main?.inputs === 'number') maxInputs = Math.max(maxInputs, main.inputs);
-
-      for (const [sessionId, info] of this.childSessions) {
-        if (!isDomTarget(info?.type)) continue;
-        if (!runtimeEnabled.has(sessionId)) {
-          try {
-            await this.sendToChild(sessionId, 'Runtime.enable');
-            runtimeEnabled.add(sessionId);
-          } catch {}
-        }
-        try {
-          const res = await this.sendToChild<any>(sessionId, 'Runtime.evaluate', {
-            expression,
-            awaitPromise: true,
-            returnByValue: true,
-          });
-          const value = res.result?.value as FrameResult | undefined;
-          if (value?.ok) return value;
-          if (value?.fatal) {
-            throw new FatalActionError(
-              value.message ?? `Action rejected: ${value.reason ?? 'unknown'}`,
-              coerceFatalReason(value.reason),
-            );
-          }
-          if (typeof value?.inputs === 'number') maxInputs = Math.max(maxInputs, value.inputs);
-        } catch (err: any) {
-          if (err instanceof FatalActionError) throw err;
-          this.log('info', `Frame ${info?.url ?? sessionId}: ${err?.message ?? err}`);
-        }
-      }
-
-      await sleep(500);
-    }
-
-    throw new Error(
-      `Locator not found within ${timeoutMs / 1000}s (max inputs seen in any frame: ${maxInputs})`,
+    return this.domExecutor.runUntilFound(
+      this.tabTarget,
+      this.childSessions,
+      expression,
+      timeoutMs,
     );
-  }
-
-  private async evalSafe(target: Target, expression: string): Promise<FrameResult | null> {
-    try {
-      const res = await this.sendCmd<any>(target, 'Runtime.evaluate', {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      return res.result?.value ?? null;
-    } catch {
-      return null;
-    }
   }
 
   // ---------- CDP fallback: DOM.performSearch with XPath ----------
@@ -1945,376 +968,17 @@ export class Page {
     mode: Mode,
     opts: { value?: string } & GetOptions,
   ): Promise<FrameResult> {
-    const mainResult = await this.cdpFindAndActOnTarget(
-      (m, p) => this.sendCmd(this.tabTarget, m, p),
+    return this.domExecutor.cdpFindAndAct(
+      this.tabTarget,
+      this.childSessions,
+      this.cdpReadyChildren,
       locator,
       mode,
       opts,
     );
-    if (mainResult) return mainResult;
-
-    for (const [sessionId, info] of this.childSessions) {
-      if (!isDomTarget(info?.type)) continue;
-      try {
-        if (!this.cdpReadyChildren.has(sessionId)) {
-          await this.sendToChild(sessionId, 'DOM.enable');
-          this.cdpReadyChildren.add(sessionId);
-        }
-        const res = await this.cdpFindAndActOnTarget(
-          (m, p) => this.sendToChild(sessionId, m, p),
-          locator,
-          mode,
-          opts,
-        );
-        if (res) {
-          if (!res.frame && info?.url) res.frame = info.url;
-          return res;
-        }
-      } catch (err: any) {
-        if (err instanceof FatalActionError) throw err;
-        this.log('info', `CDP on ${info?.type ?? 'child'} ${info?.url ?? sessionId}: ${err?.message ?? err}`);
-      }
-    }
-
-    throw new Error('No match found via CDP DOM walk.');
   }
 
-  /** Find a nodeId by XPath, then call the action function on it. */
-  private async cdpFindAndActOnTarget(
-    send: (method: string, params?: Record<string, unknown>) => Promise<any>,
-    locator: Locator,
-    mode: Mode,
-    opts: { value?: string } & GetOptions,
-  ): Promise<FrameResult | null> {
-    const nodeId = await this.cdpResolveXPath(send, locator.xpath);
-    if (!nodeId) return null;
-
-    let objectId: string | undefined;
-    try {
-      const resolved = await send('DOM.resolveNode', { nodeId });
-      objectId = resolved?.object?.objectId;
-      if (!objectId) return null;
-
-      const fnDecl = buildCallFunctionExpression(mode, opts);
-      const result = await send('Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: fnDecl,
-        returnByValue: true,
-        awaitPromise: true,
-      });
-      if (result?.exceptionDetails) {
-        throw new Error(
-          result.exceptionDetails.exception?.description ??
-            result.exceptionDetails.text ??
-            'callFunctionOn failed',
-        );
-      }
-      const out = (result?.result?.value as FrameResult | undefined) ?? null;
-      // Mirror runUntilFound: a CDP-resolved match that returns fatal:true
-      // means "found but state-rejected" — bubble it past the frame loop.
-      if (out?.fatal) {
-        throw new FatalActionError(
-          out.message ?? `Action rejected: ${out.reason ?? 'unknown'}`,
-          coerceFatalReason(out.reason),
-        );
-      }
-      return out;
-    } finally {
-      if (objectId) {
-        await send('Runtime.releaseObject', { objectId }).catch(() => {});
-      }
-    }
-  }
-
-  /**
-   * Resolve an XPath against the page, piercing every shadow root (open AND
-   * closed) and same-origin iframe document.
-   *
-   * Strategy (each step is a fallback when the previous can't see closed
-   * shadow content):
-   *
-   *   1. `DOM.getDocument({depth:-1, pierce:true})` — full pierced tree.
-   *   2. Walk the tree collecting Document + ShadowRoot + contentDocument
-   *      nodeIds, plus host->shadow-root lookup keyed by backendNodeId.
-   *   3. For each root, `DOM.resolveNode` → objectId, then
-   *      `Runtime.callFunctionOn` runs:
-   *        a. `document.evaluate(xp, this, …)` (and `.` + xp for non-Document
-   *           contexts) — works inside main doc + open shadows.
-   *        b. For shadow contexts, falls back to parsing the shadow's
-   *           outerHTML into a synthetic doc, running XPath there, and
-   *           path-replaying the result back to the live shadow tree. This
-   *           is what catches Shepherd's closed shadow on the Take Payment
-   *           page, where `document.evaluate` against the live ShadowRoot
-   *           returns null even though the element exists.
-   *   4. First root that returns a hit wins; convert its RemoteObject back
-   *      into a nodeId via `DOM.requestNode`.
-   *
-   * We deliberately avoid `DOM.performSearch` — it's documented to traverse
-   * closed shadow roots but empirically returns 0 hits on Shepherd while
-   * DevTools' Cmd+F finds the same XPath fine.
-   */
-  private async cdpResolveXPath(
-    send: (method: string, params?: Record<string, unknown>) => Promise<any>,
-    xpath: string,
-  ): Promise<number | null> {
-    const doc = await send('DOM.getDocument', { depth: -1, pierce: true });
-    const rootIds: number[] = [];
-    collectRootNodeIds(doc?.root, rootIds);
-    if (rootIds.length === 0) {
-      this.log('info', 'CDP DOM walk: no roots collected from getDocument.');
-      return null;
-    }
-
-    // Two-strategy resolver:
-    //  - direct: document.evaluate against the live root (works for main doc
-    //    + open shadow roots).
-    //  - clone: deep-clone the shadow root's children into a hidden holder
-    //    attached to the main document, run XPath there, then replay the
-    //    child-index path back into the live shadow tree. Slower but works
-    //    when Chrome's XPath engine refuses to descend into a closed
-    //    ShadowRoot context. We use cloneNode(true) — NOT outerHTML+parse —
-    //    because HTML5 parsing collapses nested <body> elements (which
-    //    Shepherd's shadow root has at the top level), which would scramble
-    //    child indices and break path-replay.
-    //
-    // Returns either the matched node, or a small object describing why
-    // nothing matched (`__cdp_resolve__: 'direct'|'clone'|'none'`) so the
-    // caller can log which strategy each root tried.
-    const fnDecl = `function (xp) {
-      var ctx = this;
-      var isDoc = ctx.nodeType === 9;
-      var isFrag = ctx.nodeType === 11;
-
-      function relativize(q) { return q.charAt(0) === '/' ? '.' + q : q; }
-
-      // (a) direct document.evaluate — main doc + open shadow roots
-      try {
-        var doc = isDoc ? ctx : (ctx.ownerDocument || document);
-        var queries = isDoc ? [xp] : [relativize(xp), xp];
-        for (var i = 0; i < queries.length; i++) {
-          try {
-            var r = doc.evaluate(queries[i], ctx, null, 9, null);
-            if (r && r.singleNodeValue) return r.singleNodeValue;
-          } catch (e) {}
-        }
-      } catch (e) {}
-
-      // (b) clone-into-light-DOM fallback for closed shadow roots
-      if (isFrag && ctx.children && ctx.children.length > 0) {
-        var mainDoc = ctx.ownerDocument || document;
-        var holder = null;
-        try {
-          holder = mainDoc.createElement('div');
-          holder.style.cssText =
-            'position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;overflow:hidden;visibility:hidden;';
-          // Must be attached to a document tree for evaluate to see it.
-          mainDoc.body.appendChild(holder);
-          for (var c = 0; c < ctx.children.length; c++) {
-            holder.appendChild(ctx.children[c].cloneNode(true));
-          }
-          var sq = relativize(xp);
-          var sr = mainDoc.evaluate(sq, holder, null, 9, null);
-          if (sr && sr.singleNodeValue) {
-            // Walk up from cloned match to one of holder.children,
-            // recording child-indices. Replay onto the live shadow root.
-            var path = [];
-            var n = sr.singleNodeValue;
-            while (n && n.parentElement && n.parentElement !== holder) {
-              var sibs = n.parentElement.children;
-              for (var k = 0; k < sibs.length; k++) {
-                if (sibs[k] === n) { path.unshift(k); break; }
-              }
-              n = n.parentElement;
-            }
-            if (n && n.parentElement === holder) {
-              var topIdx = -1;
-              for (var m = 0; m < holder.children.length; m++) {
-                if (holder.children[m] === n) { topIdx = m; break; }
-              }
-              if (topIdx >= 0) {
-                path.unshift(topIdx);
-                var live = ctx;
-                for (var p = 0; p < path.length; p++) {
-                  var idx = path[p];
-                  if (!live.children || idx >= live.children.length) {
-                    live = null; break;
-                  }
-                  live = live.children[idx];
-                }
-                if (live) return live;
-              }
-            }
-            // Clone matched but path-replay failed — return a sentinel so
-            // the caller can log it.
-            return { __cdp_resolve__: 'clone-replay-failed' };
-          }
-          // Clone tried, no match.
-          return { __cdp_resolve__: 'clone-no-match' };
-        } catch (e) {
-          return { __cdp_resolve__: 'clone-threw', err: String(e) };
-        } finally {
-          if (holder && holder.parentNode) holder.parentNode.removeChild(holder);
-        }
-      }
-
-      return null;
-    }`;
-
-    let walked = 0;
-    let errored = 0;
-    const synthOutcomes: string[] = [];
-    for (const rootNodeId of rootIds) {
-      walked++;
-      let rootObjectId: string | undefined;
-      let matchObjectId: string | undefined;
-      try {
-        const resolved = await send('DOM.resolveNode', { nodeId: rootNodeId });
-        rootObjectId = resolved?.object?.objectId;
-        if (!rootObjectId) continue;
-
-        const res = await send('Runtime.callFunctionOn', {
-          objectId: rootObjectId,
-          functionDeclaration: fnDecl,
-          arguments: [{ value: xpath }],
-          returnByValue: false,
-        });
-        if (res?.exceptionDetails) {
-          errored++;
-          continue;
-        }
-        const obj = res?.result;
-        if (!obj) continue;
-        // Null comes back as { type: 'object', subtype: 'null', value: null }.
-        if (obj.subtype === 'null' || obj.type === 'undefined') continue;
-        matchObjectId = obj.objectId;
-        if (!matchObjectId) continue;
-
-        // The function returns either an Element (subtype 'node') or, for
-        // closed-shadow clone attempts, a diagnostic sentinel object. Read
-        // the sentinel before falling through to DOM.requestNode.
-        if (obj.subtype !== 'node') {
-          try {
-            const sentinel = await send('Runtime.callFunctionOn', {
-              objectId: matchObjectId,
-              functionDeclaration: 'function () { return this.__cdp_resolve__; }',
-              returnByValue: true,
-            });
-            const tag = sentinel?.result?.value;
-            if (typeof tag === 'string') synthOutcomes.push(tag);
-          } catch {
-            /* ignore diagnostic failure */
-          }
-          continue;
-        }
-
-        const requested = await send('DOM.requestNode', { objectId: matchObjectId });
-        const matchNodeId: number | undefined = requested?.nodeId;
-        if (matchNodeId) {
-          this.log('info', `CDP DOM walk: matched after ${walked}/${rootIds.length} roots.`);
-          return matchNodeId;
-        }
-      } catch {
-        errored++;
-      } finally {
-        if (matchObjectId) {
-          await send('Runtime.releaseObject', { objectId: matchObjectId }).catch(() => {});
-        }
-        if (rootObjectId) {
-          await send('Runtime.releaseObject', { objectId: rootObjectId }).catch(() => {});
-        }
-      }
-    }
-
-    const synthSummary =
-      synthOutcomes.length > 0 ? `; synth: ${synthOutcomes.join(', ')}` : '';
-    this.log(
-      'info',
-      `CDP DOM walk: no match across ${rootIds.length} roots (${errored} errored)${synthSummary}.`,
-    );
-    return null;
-  }
-
-  /**
-   * Validate an XPath expression up-front. Without this the fast path runs to
-   * its full 20-second timeout on a typo and the user sees a vague "Locator
-   * not found" — this turns it into "Bad XPath: …".
-   */
-  private async validateXPath(xpath: string): Promise<void> {
-    try {
-      const res = await this.sendCmd<any>(this.tabTarget, 'Runtime.evaluate', {
-        expression:
-          `(() => { try { document.createExpression(${JSON.stringify(xpath)}); return null; } ` +
-          `catch (e) { return e.message || String(e); } })()`,
-        returnByValue: true,
-      });
-      const errMsg = res?.result?.value;
-      if (errMsg) {
-        throw new Error(`Bad XPath: ${errMsg} — '${xpath}'`);
-      }
-    } catch (err: any) {
-      if (err?.message?.startsWith('Bad XPath')) throw err;
-    }
-  }
-
-  // ---------- chrome.debugger plumbing ----------
-
-  private attach(target: Target): Promise<void> {
-    return new Promise((resolve, reject) => {
-      chrome.debugger.attach(target, PROTOCOL_VERSION, () => {
-        const err = chrome.runtime.lastError;
-        if (err) reject(new Error(err.message));
-        else resolve();
-      });
-    });
-  }
-
-  private sendCmd<T = any>(
-    target: Target,
-    method: string,
-    params: Record<string, unknown> = {},
-  ): Promise<T> {
-    return new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand(target, method, params, (result) => {
-        const err = chrome.runtime.lastError;
-        if (err) reject(new Error(`${method}: ${err.message}`));
-        else resolve(result as T);
-      });
-    });
-  }
-
-  private sendToChild<T = any>(
-    sessionId: string,
-    method: string,
-    params: Record<string, unknown> = {},
-  ): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const id = this.nextMsgId++;
-      const timer = setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(`${method} (child) timed out`));
-        }
-      }, CHILD_CMD_TIMEOUT_MS);
-      this.pending.set(id, {
-        resolve: (v: any) => {
-          clearTimeout(timer);
-          resolve(v as T);
-        },
-        reject: (e: Error) => {
-          clearTimeout(timer);
-          reject(e);
-        },
-      });
-      this.sendCmd(this.tabTarget, 'Target.sendMessageToTarget', {
-        sessionId,
-        message: JSON.stringify({ id, method, params }),
-      }).catch((err) => {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(err);
-      });
-    });
-  }
+  // ---------- chrome.debugger plumbing (moved to CDPPort) ----------
 
   private waitForLoad(timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -2339,193 +1003,4 @@ export class Page {
       });
     });
   }
-}
-
-/** True if a child target's type can run DOM/Runtime evaluation. */
-/**
- * Walks a CDP DOM tree (from DOM.getDocument({pierce:true})) looking for any
- * shadow root with `shadowRootType === 'closed'`. Short-circuits on first hit.
- * Recurses into children, shadowRoots, and contentDocument so it catches
- * closed shadow inside same-origin iframes too.
- */
-function anyClosedShadow(node: any): boolean {
-  if (!node || typeof node !== 'object') return false;
-  if (Array.isArray(node.shadowRoots)) {
-    for (const sr of node.shadowRoots) {
-      if (sr?.shadowRootType === 'closed') return true;
-      if (anyClosedShadow(sr)) return true;
-    }
-  }
-  if (Array.isArray(node.children)) {
-    for (const c of node.children) {
-      if (anyClosedShadow(c)) return true;
-    }
-  }
-  if (node.contentDocument && anyClosedShadow(node.contentDocument)) return true;
-  return false;
-}
-
-function isDomTarget(type: string | undefined): boolean {
-  return type === 'iframe' || type === 'page';
-}
-
-/**
- * Cross-platform absolute-path heuristic for `DOM.setFileInputFiles`.
- *   - Unix / macOS: starts with `/`
- *   - Windows drive: `C:\…` or `C:/…`
- *   - Windows UNC:   `\\server\share\…`
- * Anything else we treat as relative and reject up-front.
- */
-function isAbsoluteFilePath(p: string): boolean {
-  if (!p) return false;
-  if (p.startsWith('/')) return true;
-  if (/^[A-Za-z]:[\\/]/.test(p)) return true;
-  if (p.startsWith('\\\\')) return true;
-  return false;
-}
-
-/**
- * Build a predicate from a status filter. Three accepted forms:
- *   - undefined        → accept any status
- *   - number           → exact match (e.g., 200)
- *   - number[]         → any-of (e.g., [200, 201, 204])
- *   - range object     → keyed by '>=', '>', '<=', '<', '==' (e.g., {">=":200,"<":300})
- *
- * The validator already rejects malformed inputs at parse time; this helper
- * trusts its caller to pass a shape that's already been validated.
- */
-function buildStatusPredicate(
-  filter: number | number[] | Record<string, number> | undefined,
-): (status: number) => boolean {
-  if (filter === undefined) return () => true;
-  if (typeof filter === 'number') {
-    return (s) => s === filter;
-  }
-  if (Array.isArray(filter)) {
-    const set = new Set(filter);
-    return (s) => set.has(s);
-  }
-  // Range form: AND of comparisons.
-  const checks: Array<(s: number) => boolean> = [];
-  for (const [op, value] of Object.entries(filter)) {
-    switch (op) {
-      case '>=': checks.push((s) => s >= value); break;
-      case '>':  checks.push((s) => s >  value); break;
-      case '<=': checks.push((s) => s <= value); break;
-      case '<':  checks.push((s) => s <  value); break;
-      case '==': checks.push((s) => s === value); break;
-      // Validator should have caught unknown ops; fall through silently.
-    }
-  }
-  return (s) => checks.every((c) => c(s));
-}
-
-/**
- * Build a human-readable label of what we're filtering on. Used as the
- * `errLabel` argument to `EventWaiter.await` so timeout messages say
- * exactly which response we were waiting for.
- */
-function describeResponseFilter(opts: {
-  urlMatches: string;
-  status?: number | number[] | Record<string, number>;
-  method?: string;
-}): string {
-  const bits: string[] = [`URL matching '${opts.urlMatches}'`];
-  if (opts.status !== undefined) {
-    if (typeof opts.status === 'number') {
-      bits.push(`status ${opts.status}`);
-    } else if (Array.isArray(opts.status)) {
-      bits.push(`status in [${opts.status.join(', ')}]`);
-    } else {
-      const parts = Object.entries(opts.status).map(([op, v]) => `${op}${v}`);
-      bits.push(`status ${parts.join(' & ')}`);
-    }
-  }
-  if (opts.method) bits.push(`method ${opts.method.toUpperCase()}`);
-  return `network response (${bits.join(', ')})`;
-}
-
-/**
- * Coerce a Runtime.evaluate result into a string for `ctx.outputs` storage.
- * Outputs are `Record<string, string>`, so non-string values need a stable
- * representation. JSON.stringify covers objects / arrays; we strip null /
- * undefined to empty so a downstream `{{var}}` substitution doesn't render
- * literal "null".
- */
-function serializeEvalResult(value: unknown): string {
-  if (value == null) return '';
-  const t = typeof value;
-  if (t === 'string') return value as string;
-  if (t === 'number' || t === 'boolean') return String(value);
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-/**
- * Map a friendly key name to the params CDP `Input.dispatchKeyEvent` expects.
- * Covers Enter, Tab, Escape, arrow keys, Backspace, Delete, Space — the keys
- * an automation actually needs. For anything else we fall back to treating
- * the key as a single character (best-effort, no synthetic shift handling).
- */
-function mapKeyToCdp(key: string): {
-  key: string;
-  code: string;
-  windowsVirtualKeyCode?: number;
-  text?: string;
-} {
-  switch (key) {
-    case 'Enter':
-      return { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' };
-    case 'Tab':
-      return { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 };
-    case 'Escape':
-      return { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 };
-    case 'Backspace':
-      return { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 };
-    case 'Delete':
-      return { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 };
-    case 'ArrowDown':
-      return { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 };
-    case 'ArrowUp':
-      return { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 };
-    case 'ArrowLeft':
-      return { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 };
-    case 'ArrowRight':
-      return { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 };
-    case ' ':
-    case 'Space':
-      return { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' };
-    default:
-      return { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, text: key };
-  }
-}
-
-/**
- * Walks a pierced CDP DOM tree and collects every nodeId we can scope an XPath
- * to: the main Document, each ShadowRoot (open or closed), and every
- * same-origin iframe's contentDocument. Order matters — main document first,
- * then shadow roots in tree order, then iframe docs — so that a hit in the
- * light DOM beats a hit in a shadow.
- *
- * Shadow roots come through CDP as `shadowRoots: [...]` on their host element,
- * with `nodeType === 11` (DocumentFragment). Documents have `nodeType === 9`.
- */
-function collectRootNodeIds(node: any, out: number[]): void {
-  if (!node || typeof node !== 'object') return;
-  if (node.nodeType === 9 && typeof node.nodeId === 'number') {
-    out.push(node.nodeId);
-  }
-  if (Array.isArray(node.shadowRoots)) {
-    for (const sr of node.shadowRoots) {
-      if (sr && typeof sr.nodeId === 'number') out.push(sr.nodeId);
-      collectRootNodeIds(sr, out);
-    }
-  }
-  if (Array.isArray(node.children)) {
-    for (const c of node.children) collectRootNodeIds(c, out);
-  }
-  if (node.contentDocument) collectRootNodeIds(node.contentDocument, out);
 }

@@ -1,22 +1,23 @@
 import type { ExecutionContext, GetStep } from '../schema';
 import { resolveLocator } from '../schema';
 import type { Page } from '../page';
-import { withLocatorContext } from '../errors';
 
 export async function getAction(step: GetStep, ctx: ExecutionContext, page: Page) {
   const locator = resolveLocator(step, ctx);
-  const result = await withLocatorContext(
-    { action: step.action, original: step.xpath, resolved: locator.xpath },
-    () =>
-      page.get(locator, {
-        attribute: step.attribute,
-        property: step.property,
-        regex: step.regex,
-        regexFlags: step.regexFlags,
-        pierceClosed: step.pierceClosed,
-        timeoutMs: step.timeoutMs,
-      }),
-  );
+  const result = await page.executeAction({
+    name: step.action,
+    mode: 'get',
+    locator,
+    originalXPath: step.xpath,
+    opts: {
+      attribute: step.attribute,
+      property: step.property,
+      regex: step.regex,
+      regexFlags: step.regexFlags,
+    },
+    timeoutMs: step.timeoutMs,
+    pierceClosed: step.pierceClosed,
+  });
   const value = result.value ?? '';
   if (step.saveAs) ctx.outputs[step.saveAs] = value;
   const shown = value === '' ? '(empty)' : `"${value}"`;
