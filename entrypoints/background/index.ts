@@ -31,6 +31,17 @@ export default defineBackground(() => {
     .setPanelBehavior({ openPanelOnActionClick: true })
     .catch((err: unknown) => console.error('sidePanel error:', err));
 
+  // Notify sidepanel when extension is updated — prompts user to reload
+  chrome.runtime.onInstalled.addListener((details) => {
+    if (details.reason === 'update') {
+      chrome.runtime.sendMessage({
+        type: 'log',
+        level: 'info',
+        message: `Extension updated to ${chrome.runtime.getManifest().version}. Click "Reload Extension" in sidepanel if needed.`,
+      });
+    }
+  });
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === 'listAutomations') {
       sendResponse({ ok: true, automations: listAutomations() });

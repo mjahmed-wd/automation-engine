@@ -13,4 +13,14 @@ export default defineConfig({
       default_title: 'Open Automation Engine sidebar',
     },
   },
+  vite: () => ({
+    build: {
+      // Force clean rebuilds — prevent stale service worker caching
+      emptyOutDir: true,
+      // Disable incremental builds — avoids HMR cache issues in dev
+      minify: 'esbuild',
+    },
+    // Clear caches on restart
+    clearScreen: true,
+  }),
 });
