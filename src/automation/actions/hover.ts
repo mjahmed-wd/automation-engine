@@ -1,6 +1,6 @@
-import type { ExecutionContext, HoverStep } from '../schema';
-import { resolveLocator } from '../schema';
+import type { HoverStep } from '../schema';
 import type { Page } from '../page';
+import { defineAction } from './factory';
 
 /**
  * Hover over an element. Used as a precondition for "hover reveals
@@ -10,15 +10,7 @@ import type { Page } from '../page';
  *   { "action": "hover",  "xpath": "//div[@class='row'][1]" }
  *   { "action": "click",  "xpath": "//div[@class='row'][1]//button[normalize-space(.)='Edit']" }
  */
-export async function hoverAction(step: HoverStep, ctx: ExecutionContext, page: Page) {
-  const locator = resolveLocator(step, ctx);
-  const result = await page.executeAction({
-    name: step.action,
-    mode: 'hover',
-    locator,
-    originalXPath: step.xpath,
-    timeoutMs: step.timeoutMs,
-    pierceClosed: step.pierceClosed,
-  });
-  ctx.log('success', `Hovered ${result.tag ?? 'element'} in ${result.frame}`);
-}
+export const hoverAction = defineAction<'hover', HoverStep>({
+  mode: 'hover',
+  buildLogMessage: (result) => `Hovered ${result.tag ?? 'element'} in ${result.frame}`,
+});

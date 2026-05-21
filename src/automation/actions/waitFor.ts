@@ -1,16 +1,8 @@
-import type { ExecutionContext, WaitForStep } from '../schema';
-import { resolveLocator } from '../schema';
+import type { WaitForStep } from '../schema';
 import type { Page } from '../page';
+import { defineAction } from './factory';
 
-export async function waitForAction(step: WaitForStep, ctx: ExecutionContext, page: Page) {
-  const locator = resolveLocator(step, ctx);
-  const result = await page.executeAction({
-    name: step.action,
-    mode: 'find',
-    locator,
-    originalXPath: step.xpath,
-    timeoutMs: step.timeoutMs,
-    pierceClosed: step.pierceClosed,
-  });
-  ctx.log('success', `Element appeared in ${result.frame}`);
-}
+export const waitForAction = defineAction<'find', WaitForStep>({
+  mode: 'find',
+  buildLogMessage: () => `Element appeared`,
+});
